@@ -1,0 +1,5 @@
+CompileFlags:
+  Add:
+    - -I/opt/homebrew/opt/googletest/include
+    - -I/opt/homebrew/opt/libomp/include
+    - -Itests
