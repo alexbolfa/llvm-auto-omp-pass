@@ -18,6 +18,7 @@ llvm_dep = dependency(
 
 gtest_dep = dependency('gtest', required: true, include_type: 'system')
 gtest_main_dep = dependency('gtest_main', required: true, include_type: 'system')
+gbench_dep = dependency('benchmark', required: true, include_type: 'system')
 
 # ====== Plugin Library ======
 auto_omp_lib = shared_library(
@@ -46,7 +47,7 @@ test_exe = executable(
   dependencies: [gtest_dep, gtest_main_dep],
   include_directories: include_directories('tests'),
   cpp_args: [
-      '-O1',
+      '-O3',
       # '-Rpass-analysis=auto-omp',
       '-fpass-plugin=' + auto_omp_lib.full_path()
   ],
@@ -54,3 +55,28 @@ test_exe = executable(
 )
 
 test('loop_tests', test_exe)
+
+# ====== Benchmark Setup ======
+bench_exe = executable(
+  'loop_benchmarks',
+  ['tests/bench.cpp', barrier],
+  dependencies: [gbench_dep],
+  include_directories: include_directories('tests'),
+  cpp_args: [
+      '-O3',
+      '-fpass-plugin=' + auto_omp_lib.full_path()
+  ],
+  link_args: ['-fopenmp'],
+)
+
+benchmark('loop_benchmarks', bench_exe)
+
+bench_seq_exe = executable(
+  'loop_benchmarks_seq',
+  'tests/bench.cpp',
+  dependencies: [gbench_dep],
+  include_directories: include_directories('tests'),
+  cpp_args: ['-O1'],
+)
+
+benchmark('loop_benchmarks_seq', bench_seq_exe)
