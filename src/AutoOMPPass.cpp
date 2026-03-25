@@ -2,7 +2,8 @@
 #include "LoopCandidate.h"
 #include "LoopCodegen.h"
 
-#include "llvm/Analysis/DependenceAnalysis.h"
+#include "llvm/Analysis/IVDescriptors.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -14,34 +15,6 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "auto-omp"
-
-static Value *getMemPointer(Instruction &I) {
-    if (auto *LI = dyn_cast<LoadInst>(&I)) {
-        return LI->getPointerOperand();
-    }
-    if (auto *SI = dyn_cast<StoreInst>(&I)) {
-        return SI->getPointerOperand();
-    }
-    return nullptr;
-}
-
-static std::optional<ReductionInfo> detectReduction(PHINode &PN, Loop *L) {
-    Value *InitVal = PN.getIncomingValueForBlock(L->getLoopPreheader());
-    Value *LatchVal = PN.getIncomingValueForBlock(L->getLoopLatch());
-    if (!InitVal || !LatchVal) {
-        return std::nullopt;
-    }
-
-    auto *Update = dyn_cast<Instruction>(LatchVal);
-    // Note: FP requires -ffast-math
-    if (!Update || !Update->isBinaryOp() ||
-        (Update->getOperand(0) != &PN && Update->getOperand(1) != &PN) ||
-        !Update->isAssociative() || !Update->isCommutative()) {
-        return std::nullopt;
-    }
-
-    return ReductionInfo{&PN, InitVal, Update};
-}
 
 static bool checkStructure(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, auto &Remark) {
     unsigned TC = SE.getSmallConstantTripCount(L);
@@ -90,33 +63,21 @@ static bool checkStructure(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, auto
     return true;
 }
 
-static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate &LC, auto &Remark) {
+static bool checkSafety(Loop *L, Function &F, LoopCandidate &LC, const LoopAccessInfo &LAI,
+                         auto &Remark) {
+    // Validate reductions using RecurrenceDescriptor.
     for (PHINode &PN : LC.Header->phis()) {
         if (&PN == LC.IV) {
             continue;
         }
-        auto R = detectReduction(PN, L);
-        if (!R) {
+        RecurrenceDescriptor RedDes;
+        if (!RecurrenceDescriptor::isReductionPHI(&PN, L, RedDes)) {
             Remark("❌ unsupported loop-carried dependency");
             return false;
         }
-        LC.Reductions.push_back(*R);
-    }
-
-    // Reject inter-dependent reductions (e.g. a += b; b += arr[i]).
-    if (LC.Reductions.size() > 1) {
-        SmallPtrSet<Value *, 4> RedPhis;
-        for (auto &R : LC.Reductions) {
-            RedPhis.insert(R.Phi);
-        }
-        for (auto &R : LC.Reductions) {
-            Value *Other = R.Update->getOperand(0) == R.Phi ? R.Update->getOperand(1)
-                                                            : R.Update->getOperand(0);
-            if (RedPhis.count(Other)) {
-                Remark("❌ inter-dependent reductions");
-                return false;
-            }
-        }
+        Value *InitVal = PN.getIncomingValueForBlock(L->getLoopPreheader());
+        auto *Update = cast<Instruction>(PN.getIncomingValueForBlock(L->getLoopLatch()));
+        LC.Reductions.push_back({&PN, InitVal, Update});
     }
 
     // Reject reductions whose accumulator is stored to non-local memory
@@ -152,7 +113,7 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
         }
     }
 
-    // Reject atomics and any call with side effects.
+    // Reject atomics and any call that accesses memory.
     for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : *BB) {
             if (I.isAtomic()) {
@@ -176,47 +137,10 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
         }
     }
 
-    SmallVector<Instruction *, 16> MemInsts;
-    for (BasicBlock *BB : L->blocks()) {
-        for (Instruction &I : *BB) {
-            Value *Ptr = getMemPointer(I);
-            if (!Ptr) {
-                continue;
-            }
-            bool IsLocal = LC.LoopLocalAllocas.count(getUnderlyingObject(Ptr));
-            if (isa<StoreInst>(I) && L->isLoopInvariant(Ptr) && !IsLocal) {
-                Remark("❌ store to loop-invariant address");
-                return false;
-            }
-            if (!IsLocal) {
-                MemInsts.push_back(&I);
-            }
-        }
-    }
-
-    for (auto *Src : MemInsts) {
-        for (auto *Dst : MemInsts) {
-            if (isa<LoadInst>(Src) && isa<LoadInst>(Dst)) {
-                continue;
-            }
-            auto D = DI.depends(Src, Dst, true);
-            if (!D) {
-                continue;
-            }
-            if (D->isConfused()) {
-                Remark("❌ potential cross-iteration memory dependency");
-                return false;
-            }
-            unsigned Levels = D->getLevels();
-            if (Levels == 0) {
-                continue;
-            }
-            unsigned Dir = D->getDirection(1);
-            if (Dir & (Dependence::DVEntry::LT | Dependence::DVEntry::GT)) {
-                Remark("❌ cross-iteration memory dependency");
-                return false;
-            }
-        }
+    // Memory dependence checking via LoopAccessInfo.
+    if (!LAI.canVectorizeMemory() || LAI.getNumRuntimePointerChecks() > 0) {
+        Remark("❌ unsafe memory dependence");
+        return false;
     }
 
     // Reject if non-reduction loop-variant values escape via LCSSA PHIs.
@@ -241,19 +165,19 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
 }
 
 static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolution &SE,
-                            DependenceInfo &DI, Function &F, auto &Remark) {
+                            const LoopAccessInfo &LAI, Function &F, auto &Remark) {
     LoopCandidate LC;
     if (!checkStructure(L, SE, LC, Remark)) {
         return false;
     }
-    if (!checkSafety(L, DI, F, LC, Remark)) {
+    if (!checkSafety(L, F, LC, LAI, Remark)) {
         return false;
     }
 
     if (LC.Reductions.empty()) {
-        Remark("✅ parallelizing: #omp parallel for simd");
+        Remark("✅ #omp parallel for simd");
     } else {
-        Remark("✅ parallelizing: #omp parallel for simd reduction");
+        Remark("✅ #omp parallel for simd reduction");
     }
 
     return emitParallelLoop(L, LC, OMPBuilder, F);
@@ -266,16 +190,23 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
     auto &LI = AM.getResult<LoopAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     auto &ORE = AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
-    auto &DI = AM.getResult<DependenceAnalysis>(F);
+    auto &LAM = AM.getResult<LoopAccessAnalysis>(F);
 
     OpenMPIRBuilder OMPBuilder(*F.getParent());
     OMPBuilder.Config.IsTargetDevice = false;
     OMPBuilder.initialize();
 
-    auto OuterLoops = SmallVector<Loop *, 4>(LI.begin(), LI.end());
+    SmallVector<Loop *, 8> Worklist;
+    for (auto *TopLoop : LI) {
+        for (auto *L : depth_first(TopLoop)) {
+            if (L->isInnermost()) {
+                Worklist.push_back(L);
+            }
+        }
+    }
     bool Changed = false;
 
-    for (Loop *L : OuterLoops) {
+    for (Loop *L : Worklist) {
         auto Remark = [&](StringRef Msg) {
             if (hadRemark) {
                 return;
@@ -286,7 +217,8 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
                        << Msg;
             });
         };
-        Changed |= parallelizeLoop(L, OMPBuilder, SE, DI, F, Remark);
+        const LoopAccessInfo &LAI = LAM.getInfo(*L);
+        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAI, F, Remark);
     }
 
     if (Changed) {
