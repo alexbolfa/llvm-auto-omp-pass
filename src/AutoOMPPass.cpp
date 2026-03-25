@@ -103,6 +103,23 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
         LC.Reductions.push_back(*R);
     }
 
+    if (!LC.Reductions.empty()) {
+        SmallPtrSet<Value *, 4> RedVals;
+        for (auto &R : LC.Reductions) {
+            RedVals.insert(R.Phi);
+            RedVals.insert(R.Update);
+        }
+        for (BasicBlock *BB : L->blocks()) {
+            for (Instruction &I : *BB) {
+                auto *SI = dyn_cast<StoreInst>(&I);
+                if (SI && RedVals.count(SI->getValueOperand())) {
+                    Remark("❌ reduction value stored to memory");
+                    return false;
+                }
+            }
+        }
+    }
+
     for (Instruction &AI : F.getEntryBlock()) {
         auto *Alloca = dyn_cast<AllocaInst>(&AI);
         if (!Alloca || Alloca->user_empty()) {
