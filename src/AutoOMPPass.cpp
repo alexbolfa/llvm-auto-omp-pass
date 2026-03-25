@@ -103,6 +103,24 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
         LC.Reductions.push_back(*R);
     }
 
+    // Reject inter-dependent reductions (e.g. a += b; b += arr[i]).
+    if (LC.Reductions.size() > 1) {
+        SmallPtrSet<Value *, 4> RedPhis;
+        for (auto &R : LC.Reductions) {
+            RedPhis.insert(R.Phi);
+        }
+        for (auto &R : LC.Reductions) {
+            Value *Other = R.Update->getOperand(0) == R.Phi ? R.Update->getOperand(1)
+                                                            : R.Update->getOperand(0);
+            if (RedPhis.count(Other)) {
+                Remark("❌ inter-dependent reductions");
+                return false;
+            }
+        }
+    }
+
+    // Reject reductions whose accumulator is stored to non-local memory
+    // (e.g. prefix sum: arr[i] = running_total).
     if (!LC.Reductions.empty()) {
         SmallPtrSet<Value *, 4> RedVals;
         for (auto &R : LC.Reductions) {
@@ -150,7 +168,7 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
                     continue;
                 }
             }
-            if (CB->onlyReadsMemory() || CB->getMemoryEffects().onlyAccessesInaccessibleMem()) {
+            if (CB->doesNotAccessMemory() || CB->getMemoryEffects().onlyAccessesInaccessibleMem()) {
                 continue;
             }
             Remark("❌ call with side effects");
@@ -197,6 +215,24 @@ static bool checkSafety(Loop *L, DependenceInfo &DI, Function &F, LoopCandidate 
             if (Dir & (Dependence::DVEntry::LT | Dependence::DVEntry::GT)) {
                 Remark("❌ cross-iteration memory dependency");
                 return false;
+            }
+        }
+    }
+
+    // Reject if non-reduction loop-variant values escape via LCSSA PHIs.
+    {
+        SmallPtrSet<Value *, 4> RedVals;
+        for (auto &R : LC.Reductions) {
+            RedVals.insert(R.Phi);
+            RedVals.insert(R.Update);
+        }
+        for (PHINode &PN : LC.ExitBlock->phis()) {
+            for (unsigned i = 0; i < PN.getNumIncomingValues(); ++i) {
+                auto *I = dyn_cast<Instruction>(PN.getIncomingValue(i));
+                if (I && L->contains(I->getParent()) && !RedVals.count(I)) {
+                    Remark("❌ non-reduction value escapes loop");
+                    return false;
+                }
             }
         }
     }

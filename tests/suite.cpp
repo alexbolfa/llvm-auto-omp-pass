@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "functions/parallel_loops.cpp"
+#include "functions/not_parallel_loops.cpp"
 
 namespace {
 template <typename T> uint64_t compute_hash(const T *data, size_t n) {
@@ -94,4 +95,44 @@ TEST_F(LoopTest, GlobalIndexedWrite) {
     auto data = rand_ints(N);
     global_indexed_write(data.data(), N);
     verify_hash(compute_hash(g_output, N), 8024147421901249633ULL, "GlobalIndexedWrite");
+}
+
+// ---- Not-parallel loops (must produce correct sequential results) ----
+
+TEST_F(LoopTest, InterDependentReductions) {
+    auto data = rand_ints(N);
+    int a = 0, b = 0;
+    for (int i = 0; i < N; i++) {
+        a += b;
+        b += data[i];
+    }
+    EXPECT_EQ(store_with_reduction_variables(data.data(), N), a * b);
+}
+
+TEST_F(LoopTest, PrefixSum) {
+    auto data = rand_ints(N);
+    auto reference = data;
+    for (int i = 1; i < N; i++) {
+        reference[i] += reference[i - 1];
+    }
+    prefix_sum(data.data(), N);
+    EXPECT_EQ(data, reference);
+}
+
+TEST_F(LoopTest, ReadonlyCallRace) {
+    auto arr = rand_ints(N);
+    auto ref = arr;
+    int expected = 0;
+    for (int i = 0; i < N; i++) {
+        ref[i] = i * 2;
+        expected += ref[N - 1 - i];
+    }
+    int actual = readonly_call_race(arr.data(), N);
+    EXPECT_EQ(actual, expected);
+}
+
+TEST_F(LoopTest, LastIterationValue) {
+    auto data = rand_ints(N);
+    int expected = data[N - 1] * 2;
+    EXPECT_EQ(last_iteration_value(data.data(), N), expected);
 }

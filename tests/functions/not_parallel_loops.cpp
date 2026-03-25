@@ -6,6 +6,17 @@ void cpy_unsafe(int *dst, int *src, int N) {
     }
 }
 
+int store_with_reduction_variables(int *data, int n) {
+    int a = 0, b = 0;
+
+    for (int i = 0; i < n; i++) {
+        a += b;       // add a, b — detected as reduction on `a`
+        b += data[i]; // add b, arr[i] — detected as reduction on `b`
+    }
+
+    return a * b;
+}
+
 // ====== Cross-iteration memory recurrence ======
 
 void fibonacci(int *data, int n) {
@@ -58,6 +69,32 @@ void invariant_write(int *data, int N, int *shared) {
         data[i] = i;
         set_val_not_parallel(shared, i);
     }
+}
+
+// ====== Readonly call reading written memory ======
+
+__attribute__((noinline, pure))
+static int read_element(const int *arr, int idx) {
+    return arr[idx];
+}
+
+int readonly_call_race(int *arr, int N) {
+    int total = 0;
+    for (int i = 0; i < N; ++i) {
+        arr[i] = i * 2;
+        total += read_element(arr, N - 1 - i);
+    }
+    return total;
+}
+
+// ====== Non-reduction value escaping loop ======
+
+int last_iteration_value(const int *arr, int N) {
+    int last = 0;
+    for (int i = 0; i < N; ++i) {
+        last = arr[i] * 2;
+    }
+    return last;
 }
 
 // ====== Small trip counts (overhead > benefit) ======
