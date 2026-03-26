@@ -2,8 +2,18 @@
 
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
 
 using namespace llvm;
+
+static unsigned getReductionBinOp(Instruction *I) {
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+        if (II->getIntrinsicID() == Intrinsic::fmuladd || II->getIntrinsicID() == Intrinsic::fma) {
+            return Instruction::FAdd;
+        }
+    }
+    return I->getOpcode();
+}
 
 static void remapOperands(Instruction *I, DenseMap<Value *, Value *> &VMap) {
     for (unsigned i = 0, e = I->getNumOperands(); i < e; ++i) {
@@ -170,8 +180,10 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
             return CLI.takeError();
         }
 
-        OMPBuilder.applySimd(*CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
-                             nullptr);
+        if (LC.Reductions.empty()) {
+            OMPBuilder.applySimd(*CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
+                                 nullptr);
+        }
 
         auto WS = OMPBuilder.applyWorkshareLoop(DL, *CLI, InnerAllocaIP, true);
         if (!WS) {
@@ -191,8 +203,8 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
         for (auto &R : LC.Reductions) {
             if (&Original == R.SharedAlloca) {
                 auto *Priv = AllocaB.CreateAlloca(R.Phi->getType(), nullptr, "red.priv");
-                AllocaB.CreateStore(getReductionIdentity(R.Update->getOpcode(), R.Phi->getType()),
-                                    Priv);
+                AllocaB.CreateStore(
+                    getReductionIdentity(getReductionBinOp(R.Update), R.Phi->getType()), Priv);
                 ReplVal = Priv;
                 PrivatizedAllocas[R.SharedAlloca] = Priv;
                 return CodeGenIP;
@@ -221,7 +233,7 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
         SmallVector<OpenMPIRBuilder::ReductionInfo, 2> OMPReds;
         SmallVector<bool, 2> IsByRef;
         for (auto &R : LC.Reductions) {
-            auto RedCB = [Opc = R.Update->getOpcode()](
+            auto RedCB = [Opc = getReductionBinOp(R.Update)](
                              OpenMPIRBuilder::InsertPointTy IP, Value *LHS, Value *RHS,
                              Value *&Res) -> OpenMPIRBuilder::InsertPointOrErrorTy {
                 IRBuilder<> B(IP.getBlock(), IP.getPoint());
