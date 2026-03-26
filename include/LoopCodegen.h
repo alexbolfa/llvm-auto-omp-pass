@@ -8,7 +8,9 @@
 namespace llvm {
 
 /// Transform a validated LoopCandidate into an OpenMP parallel region.
-bool emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuilder, Function &F);
+/// OutermostL is the outermost loop of the nest (== L when no collapse).
+bool emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC, OpenMPIRBuilder &OMPBuilder,
+                      Function &F);
 
 } // end namespace llvm
 

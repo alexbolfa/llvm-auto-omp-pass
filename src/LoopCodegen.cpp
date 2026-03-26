@@ -1,76 +1,130 @@
 #include "LoopCodegen.h"
 
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
 
-static unsigned getReductionBinOp(Instruction *I) {
-    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
-        if (II->getIntrinsicID() == Intrinsic::fmuladd || II->getIntrinsicID() == Intrinsic::fma) {
-            return Instruction::FAdd;
-        }
-    }
-    return I->getOpcode();
-}
+// ===----------------------------------------------------------------------===//
+// Helpers
+// ===----------------------------------------------------------------------===//
 
 static void remapOperands(Instruction *I, DenseMap<Value *, Value *> &VMap) {
-    for (unsigned i = 0, e = I->getNumOperands(); i < e; ++i) {
-        if (auto It = VMap.find(I->getOperand(i)); It != VMap.end()) {
+    for (unsigned i = 0, e = I->getNumOperands(); i < e; ++i)
+        if (auto It = VMap.find(I->getOperand(i)); It != VMap.end())
             I->setOperand(i, It->second);
-        }
+}
+
+/// Compute ceil((Stop - Start) / Step), returning 0 for empty ranges.
+static Value *computeTripCount(IRBuilder<> &B, const LoopLevel &Lev, Type *IdxTy) {
+    Value *Start = Lev.Start, *Stop = Lev.Stop, *Step = Lev.Step;
+    if (Start->getType() != IdxTy)
+        Start = B.CreateIntCast(Start, IdxTy, Lev.IsSigned);
+    if (Stop->getType() != IdxTy)
+        Stop = B.CreateIntCast(Stop, IdxTy, Lev.IsSigned);
+    if (Step->getType() != IdxTy)
+        Step = B.CreateIntCast(Step, IdxTy, Lev.IsSigned);
+
+    Value *Span = B.CreateSub(Stop, Start);
+    if (Lev.Inclusive)
+        Span = B.CreateAdd(Span, ConstantInt::get(IdxTy, 1));
+    Value *TC = B.CreateAdd(B.CreateUDiv(B.CreateSub(Span, ConstantInt::get(IdxTy, 1)), Step),
+                            ConstantInt::get(IdxTy, 1));
+    Value *Empty = Lev.Inclusive
+                       ? (Lev.IsSigned ? B.CreateICmpSLT(Stop, Start) : B.CreateICmpULT(Stop, Start))
+                       : (Lev.IsSigned ? B.CreateICmpSLE(Stop, Start) : B.CreateICmpULE(Stop, Start));
+    return B.CreateSelect(Empty, ConstantInt::get(IdxTy, 0), TC);
+}
+
+/// Derive individual IVs from a collapsed iteration index K via div/rem.
+static void deriveCollapsedIVs(IRBuilder<> &B, Value *K, ArrayRef<LoopLevel> Levels,
+                               ArrayRef<Value *> TripCounts, DenseMap<Value *, Value *> &VMap) {
+    Value *Rem = K;
+    for (int i = Levels.size() - 1; i >= 0; --i) {
+        Value *Idx = (i == 0) ? Rem : B.CreateURem(Rem, TripCounts[i]);
+        if (i != 0)
+            Rem = B.CreateUDiv(Rem, TripCounts[i]);
+        auto &Lev = Levels[i];
+        Value *IV = B.CreateAdd(Lev.Start, B.CreateMul(Idx, Lev.Step));
+        if (IV->getType() != Lev.IV->getType())
+            IV = B.CreateIntCast(IV, Lev.IV->getType(), Lev.IsSigned);
+        VMap[Lev.IV] = IV;
     }
 }
 
+/// Clone non-terminator, non-PHI instructions from outer nest blocks into the
+/// body, so the inner loop body can reference them (e.g. GEPs using outer IVs).
+static void cloneOuterBlockValues(ArrayRef<BasicBlock *> AllNestBlocks,
+                                  ArrayRef<BasicBlock *> InnerBlocks, BasicBlock *BodyBB,
+                                  DenseMap<Value *, Value *> &VMap) {
+    SmallPtrSet<BasicBlock *, 8> InnerSet(InnerBlocks.begin(), InnerBlocks.end());
+    SmallVector<Instruction *, 16> Clones;
+    for (auto *BB : AllNestBlocks) {
+        if (InnerSet.count(BB))
+            continue;
+        for (Instruction &I : *BB) {
+            if (I.isTerminator() || isa<PHINode>(&I) || VMap.count(&I))
+                continue;
+            auto *C = I.clone();
+            C->insertInto(BodyBB, BodyBB->getTerminator()->getIterator());
+            C->setName(I.getName());
+            VMap[&I] = C;
+            Clones.push_back(C);
+        }
+    }
+    for (auto *C : Clones)
+        remapOperands(C, VMap);
+}
+
+// ===----------------------------------------------------------------------===//
+// Body cloning
+// ===----------------------------------------------------------------------===//
+
+/// Clone loop body blocks into new BBs, remap operands via VMap, and wire
+/// reduction loads/stores at header entry and latch exit.
 static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *Header,
                                 BasicBlock *Latch, BasicBlock *BodyBB, BasicBlock *ContinueBB,
                                 DenseMap<Value *, Value *> &VMap, Function &F,
                                 ArrayRef<ReductionInfo> Reductions) {
     DenseMap<BasicBlock *, BasicBlock *> BBMap;
-    for (auto *BB : SrcBlocks) {
+    for (auto *BB : SrcBlocks)
         BBMap[BB] = BasicBlock::Create(F.getContext(), BB->getName() + ".par", &F);
-    }
 
+    // Load current reduction values at header entry.
     if (!Reductions.empty()) {
         IRBuilder<> HdrB(BBMap[Header], BBMap[Header]->begin());
-        for (auto &R : Reductions) {
+        for (auto &R : Reductions)
             VMap[R.Phi] = HdrB.CreateLoad(R.Phi->getType(), R.SharedAlloca, "red.cur");
-        }
     }
 
-    for (auto *BB : SrcBlocks) {
+    // Clone non-terminator, non-header-PHI instructions.
+    for (auto *BB : SrcBlocks)
         for (Instruction &I : *BB) {
-            if (I.isTerminator() || (BB == Header && isa<PHINode>(&I))) {
+            if (I.isTerminator() || (BB == Header && isa<PHINode>(&I)))
                 continue;
-            }
             auto *C = I.clone();
             C->insertInto(BBMap[BB], BBMap[BB]->end());
             C->setName(I.getName());
             VMap[&I] = C;
         }
-    }
 
-    for (auto *BB : SrcBlocks) {
+    // Remap operands and PHI incoming blocks.
+    for (auto *BB : SrcBlocks)
         for (Instruction &I : *BBMap[BB]) {
             remapOperands(&I, VMap);
-            if (auto *PN = dyn_cast<PHINode>(&I)) {
-                for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-                    if (auto It = BBMap.find(PN->getIncomingBlock(i)); It != BBMap.end()) {
+            if (auto *PN = dyn_cast<PHINode>(&I))
+                for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+                    if (auto It = BBMap.find(PN->getIncomingBlock(i)); It != BBMap.end())
                         PN->setIncomingBlock(i, It->second);
-                    }
-                }
-            }
         }
-    }
 
+    // Wire terminators.
     for (auto *BB : SrcBlocks) {
         if (BB == Latch) {
             if (!Reductions.empty()) {
                 IRBuilder<> LB(BBMap[Latch], BBMap[Latch]->end());
-                for (auto &R : Reductions) {
+                for (auto &R : Reductions)
                     LB.CreateStore(VMap[R.Update], R.SharedAlloca);
-                }
             }
             BranchInst::Create(ContinueBB, BBMap[BB]);
         } else {
@@ -88,32 +142,34 @@ static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *He
     BranchInst::Create(BBMap[Header], BodyBB);
 }
 
-// initial value of values
-static Constant *getReductionIdentity(unsigned Opcode, Type *Ty) {
-    switch (Opcode) {
-    case Instruction::Add:
-        return ConstantInt::get(Ty, 0);
-    case Instruction::FAdd:
-        return ConstantFP::get(Ty, 0.0);
-    case Instruction::Mul:
-        return ConstantInt::get(Ty, 1);
-    case Instruction::FMul:
-        return ConstantFP::get(Ty, 1.0);
-    case Instruction::And:
-        return ConstantInt::getAllOnesValue(Ty);
-    case Instruction::Or:
-    case Instruction::Xor:
-        return ConstantInt::get(Ty, 0);
-    default:
-        return nullptr;
-    }
+// ===----------------------------------------------------------------------===//
+// Parallel loop emission
+// ===----------------------------------------------------------------------===//
+
+/// Apply SIMD (when no reductions) and workshare to a canonical loop.
+static Error finalizeLoop(CanonicalLoopInfo *CLI, OpenMPIRBuilder &OMPBuilder, DebugLoc DL,
+                          bool HasReductions, OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
+                          OpenMPIRBuilder::InsertPointTy &SavedBodyIP,
+                          OpenMPIRBuilder::InsertPointTy &SavedBodyAllocaIP) {
+    if (!HasReductions)
+        OMPBuilder.applySimd(CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
+                             nullptr);
+    auto WS = OMPBuilder.applyWorkshareLoop(DL, CLI, InnerAllocaIP, true);
+    if (!WS)
+        return WS.takeError();
+    SavedBodyIP = *WS;
+    SavedBodyAllocaIP = InnerAllocaIP;
+    return Error::success();
 }
 
-bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuilder, Function &F) {
-    SmallVector<BasicBlock *, 8> LoopBlocks(L->blocks());
+bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
+                            OpenMPIRBuilder &OMPBuilder, Function &F) {
+    SmallVector<BasicBlock *, 8> InnerLoopBlocks(L->blocks());
+    SmallVector<BasicBlock *, 16> AllNestBlocks(OutermostL->blocks());
     DebugLoc DL = L->getStartLoc();
+    auto &Bnd = LC.Bounds;
 
-    // Create shared reduction allocas in the entry block.
+    // --- Reduction setup ---
     if (!LC.Reductions.empty()) {
         IRBuilder<> EntryB(&F.getEntryBlock(), F.getEntryBlock().getFirstInsertionPt());
         IRBuilder<> PreB(LC.Preheader->getTerminator());
@@ -124,15 +180,11 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
     }
 
     SmallVector<std::pair<Use *, ReductionInfo *>, 4> ExternalRedUses;
-    for (auto &R : LC.Reductions) {
-        for (Value *V : {static_cast<Value *>(R.Update), static_cast<Value *>(R.Phi)}) {
-            for (Use &U : V->uses()) {
-                if (!L->contains(cast<Instruction>(U.getUser())->getParent())) {
+    for (auto &R : LC.Reductions)
+        for (Value *V : {static_cast<Value *>(R.Update), static_cast<Value *>(R.Phi)})
+            for (Use &U : V->uses())
+                if (!OutermostL->contains(cast<Instruction>(U.getUser())->getParent()))
                     ExternalRedUses.push_back({&U, &R});
-                }
-            }
-        }
-    }
 
     // Remove non-reduction LCSSA PHIs in the exit block.
     SmallPtrSet<Value *, 4> RedValues;
@@ -140,17 +192,14 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
         RedValues.insert(R.Phi);
         RedValues.insert(R.Update);
     }
-    for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis())) {
+    for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis()))
         if (!any_of(PN.incoming_values(), [&](Value *V) { return RedValues.count(V); })) {
             PN.replaceAllUsesWith(PN.getIncomingValue(0));
             PN.eraseFromParent();
         }
-    }
 
-    // Disconnect preheader from loop header.
+    // --- Disconnect preheader ---
     LC.Preheader->getTerminator()->eraseFromParent();
-
-    // If preheader is the entry block, split so OMPIRBuilder has separate blocks.
     if (LC.Preheader == &F.getEntryBlock()) {
         auto *NewPH = BasicBlock::Create(F.getContext(), "par.ph", &F, LC.ExitBlock);
         BranchInst::Create(NewPH, LC.Preheader);
@@ -160,41 +209,65 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
     OpenMPIRBuilder::InsertPointTy InsertPt(LC.Preheader, LC.Preheader->end());
     OpenMPIRBuilder::InsertPointTy AllocaIP(&F.getEntryBlock(),
                                             F.getEntryBlock().getFirstInsertionPt());
-
     OpenMPIRBuilder::InsertPointTy SavedBodyIP, SavedBodyAllocaIP;
 
+    // --- Body generation ---
     auto BodyGenCB = [&](OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
                          OpenMPIRBuilder::InsertPointTy CodeGenIP) -> Error {
-        auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP, Value *NewIV) -> Error {
-            DenseMap<Value *, Value *> VMap;
-            VMap[LC.IV] = NewIV;
-            cloneLoopBodyBlocks(LoopBlocks, LC.Header, LC.Latch, BodyIP.getBlock(),
+        auto CloneBody = [&](OpenMPIRBuilder::InsertPointTy BodyIP, DenseMap<Value *, Value *> &VMap) {
+            if (!LC.OuterLevels.empty())
+                cloneOuterBlockValues(AllNestBlocks, InnerLoopBlocks, BodyIP.getBlock(), VMap);
+            cloneLoopBodyBlocks(InnerLoopBlocks, LC.Header, LC.Latch, BodyIP.getBlock(),
                                 BodyIP.getBlock()->getTerminator()->getSuccessor(0), VMap, F,
                                 LC.Reductions);
-            return Error::success();
         };
 
-        auto CLI = OMPBuilder.createCanonicalLoop({CodeGenIP, DL}, LoopBodyCB, LC.Start, LC.Stop,
-                                                  LC.Step, LC.IsSigned, LC.Inclusive);
-        if (!CLI) {
+        Expected<CanonicalLoopInfo *> CLI = [&]() -> Expected<CanonicalLoopInfo *> {
+            if (LC.OuterLevels.empty()) {
+                // Single loop: use Start/Stop/Step overload.
+                auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP,
+                                      Value *NewIV) -> Error {
+                    DenseMap<Value *, Value *> VMap;
+                    VMap[Bnd.IV] = NewIV;
+                    CloneBody(BodyIP, VMap);
+                    return Error::success();
+                };
+                return OMPBuilder.createCanonicalLoop({CodeGenIP, DL}, LoopBodyCB, Bnd.Start,
+                                                      Bnd.Stop, Bnd.Step, Bnd.IsSigned,
+                                                      Bnd.Inclusive);
+            }
+
+            // Collapse: linearize the iteration space.
+            SmallVector<LoopLevel, 4> AllLevels(LC.OuterLevels.begin(), LC.OuterLevels.end());
+            AllLevels.push_back(Bnd);
+
+            IRBuilder<> TcB(CodeGenIP.getBlock(), CodeGenIP.getPoint());
+            Type *IdxTy = AllLevels[0].IV->getType();
+            SmallVector<Value *, 4> TripCounts;
+            for (auto &Lev : AllLevels)
+                TripCounts.push_back(computeTripCount(TcB, Lev, IdxTy));
+
+            Value *TotalTC = TripCounts[0];
+            for (unsigned i = 1; i < TripCounts.size(); ++i)
+                TotalTC = TcB.CreateMul(TotalTC, TripCounts[i], "collapse.tc");
+
+            auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP, Value *K) -> Error {
+                IRBuilder<> B(BodyIP.getBlock(), BodyIP.getPoint());
+                DenseMap<Value *, Value *> VMap;
+                deriveCollapsedIVs(B, K, AllLevels, TripCounts, VMap);
+                CloneBody(BodyIP, VMap);
+                return Error::success();
+            };
+            return OMPBuilder.createCanonicalLoop({CodeGenIP, DL}, LoopBodyCB, TotalTC);
+        }();
+
+        if (!CLI)
             return CLI.takeError();
-        }
-
-        if (LC.Reductions.empty()) {
-            OMPBuilder.applySimd(*CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
-                                 nullptr);
-        }
-
-        auto WS = OMPBuilder.applyWorkshareLoop(DL, *CLI, InnerAllocaIP, true);
-        if (!WS) {
-            return WS.takeError();
-        }
-
-        SavedBodyIP = *WS;
-        SavedBodyAllocaIP = InnerAllocaIP;
-        return Error::success();
+        return finalizeLoop(*CLI, OMPBuilder, DL, !LC.Reductions.empty(), InnerAllocaIP,
+                            SavedBodyIP, SavedBodyAllocaIP);
     };
 
+    // --- Privatization ---
     SmallDenseMap<Value *, AllocaInst *> PrivatizedAllocas;
     auto PrivCB = [&](OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
                       OpenMPIRBuilder::InsertPointTy CodeGenIP, Value &Original, Value &Inner,
@@ -204,7 +277,7 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
             if (&Original == R.SharedAlloca) {
                 auto *Priv = AllocaB.CreateAlloca(R.Phi->getType(), nullptr, "red.priv");
                 AllocaB.CreateStore(
-                    getReductionIdentity(getReductionBinOp(R.Update), R.Phi->getType()), Priv);
+                    getRecurrenceIdentity(R.Kind, R.Phi->getType(), FastMathFlags()), Priv);
                 ReplVal = Priv;
                 PrivatizedAllocas[R.SharedAlloca] = Priv;
                 return CodeGenIP;
@@ -228,12 +301,12 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
         return false;
     }
 
-    // Generate reduction combine code.
+    // --- Reduction combine ---
     if (!LC.Reductions.empty()) {
         SmallVector<OpenMPIRBuilder::ReductionInfo, 2> OMPReds;
         SmallVector<bool, 2> IsByRef;
         for (auto &R : LC.Reductions) {
-            auto RedCB = [Opc = getReductionBinOp(R.Update)](
+            auto RedCB = [Opc = RecurrenceDescriptor::getOpcode(R.Kind)](
                              OpenMPIRBuilder::InsertPointTy IP, Value *LHS, Value *RHS,
                              Value *&Res) -> OpenMPIRBuilder::InsertPointOrErrorTy {
                 IRBuilder<> B(IP.getBlock(), IP.getPoint());
@@ -254,45 +327,36 @@ bool llvm::emitParallelLoop(Loop *L, LoopCandidate &LC, OpenMPIRBuilder &OMPBuil
         }
     }
 
-    // Replace external uses of reduction values with final results.
+    // --- Finalize ---
     BasicBlock *AfterBB = Result->getBlock();
     if (!ExternalRedUses.empty()) {
         IRBuilder<> B(AfterBB);
-        if (AfterBB->getTerminator()) {
+        if (AfterBB->getTerminator())
             B.SetInsertPoint(AfterBB->getTerminator());
-        }
         DenseMap<ReductionInfo *, Value *> FinalVals;
-        for (auto &R : LC.Reductions) {
+        for (auto &R : LC.Reductions)
             FinalVals[&R] = B.CreateLoad(R.Phi->getType(), R.SharedAlloca, "red.result");
-        }
-        for (auto &[U, R] : ExternalRedUses) {
+        for (auto &[U, R] : ExternalRedUses)
             U->set(FinalVals[R]);
-        }
     }
 
-    for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis())) {
+    for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis()))
         if (PN.getNumIncomingValues() == 1) {
             PN.replaceAllUsesWith(PN.getIncomingValue(0));
             PN.eraseFromParent();
         }
-    }
 
-    if (!AfterBB->getTerminator()) {
+    if (!AfterBB->getTerminator())
         BranchInst::Create(LC.ExitBlock, AfterBB);
-    }
 
     // Delete original loop blocks.
-    for (auto *BB : LoopBlocks) {
-        for (Instruction &I : *BB) {
-            I.replaceAllUsesWith(UndefValue::get(I.getType()));
-        }
-    }
-    for (auto *BB : LoopBlocks) {
+    for (auto *BB : AllNestBlocks)
+        for (Instruction &I : *BB)
+            I.replaceAllUsesWith(PoisonValue::get(I.getType()));
+    for (auto *BB : AllNestBlocks)
         BB->dropAllReferences();
-    }
-    for (auto *BB : LoopBlocks) {
+    for (auto *BB : AllNestBlocks)
         BB->eraseFromParent();
-    }
 
     return true;
 }

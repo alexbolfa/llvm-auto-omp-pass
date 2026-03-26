@@ -24,6 +24,7 @@ gbench_dep = dependency('benchmark', required: true, include_type: 'system')
 auto_omp_lib = shared_library(
   'AutoOMPPass',
   'src/AutoOMPPass.cpp',
+  'src/LoopAnalysis.cpp',
   'src/LoopCodegen.cpp',
   'src/PluginRegistration.cpp',
   dependencies: [llvm_dep],

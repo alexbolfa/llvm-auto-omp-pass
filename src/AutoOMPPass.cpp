@@ -1,186 +1,82 @@
 #include "AutoOMPPass.h"
-#include "LoopCandidate.h"
+#include "LoopAnalysis.h"
 #include "LoopCodegen.h"
+#include "LoopSafety.h"
 
-#include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "auto-omp"
 
-static bool checkStructure(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, auto &Remark) {
-    unsigned TC = SE.getSmallConstantTripCount(L);
-    if (TC != 0 && TC <= 64) {
-        Remark("❌ trip count too small to benefit from parallelization");
-        return false;
+/// After the innermost loop is verified, try promoting to a larger outer loop.
+static void tryPromotion(Loop *&L, Loop *&OutermostL, LoopCandidate &LC,
+                         ScalarEvolution &SE, Function &F) {
+    auto Quiet = [](StringRef) {};
+    Loop *Candidate = L->getParentLoop();
+    while (Candidate) {
+        LoopCandidate CandLC;
+        if (!checkStructure(Candidate, SE, CandLC, Quiet))
+            break;
+        if (!checkSafety(Candidate, Candidate, F, CandLC, nullptr, Quiet))
+            break;
+        OutermostL = Candidate;
+        L = Candidate;
+        LC = CandLC;
+        Candidate = Candidate->getParentLoop();
     }
-
-    LC.Preheader = L->getLoopPreheader();
-    LC.Header = L->getHeader();
-    LC.Latch = L->getLoopLatch();
-    LC.ExitBlock = L->getExitBlock();
-    LC.ExitingBlock = L->getExitingBlock();
-
-    if (!LC.Preheader || !LC.Header || !LC.Latch || !LC.ExitBlock || !LC.ExitingBlock) {
-        Remark("❌ loop lacks canonical structure");
-        return false;
-    }
-
-    auto MaybeBounds = L->getBounds(SE);
-    if (!MaybeBounds) {
-        Remark("❌ cannot determine loop bounds");
-        return false;
-    }
-
-    auto &Bounds = *MaybeBounds;
-    LC.Start = &Bounds.getInitialIVValue();
-    LC.Stop = &Bounds.getFinalIVValue();
-    LC.Step = Bounds.getStepValue();
-    LC.IV = L->getInductionVariable(SE);
-
-    if (!LC.Step || !LC.IV) {
-        Remark("❌ no canonical induction variable");
-        return false;
-    }
-
-    auto Pred = Bounds.getCanonicalPredicate();
-    if (Pred == ICmpInst::BAD_ICMP_PREDICATE) {
-        Remark("❌ bad comparison predicate");
-        return false;
-    }
-
-    LC.IsSigned = ICmpInst::isSigned(Pred);
-    LC.Inclusive = (Pred == ICmpInst::ICMP_SLE || Pred == ICmpInst::ICMP_ULE);
-
-    return true;
-}
-
-static bool checkSafety(Loop *L, Function &F, LoopCandidate &LC, const LoopAccessInfo &LAI,
-                         auto &Remark) {
-    // Validate reductions using RecurrenceDescriptor.
-    for (PHINode &PN : LC.Header->phis()) {
-        if (&PN == LC.IV) {
-            continue;
-        }
-        RecurrenceDescriptor RedDes;
-        if (!RecurrenceDescriptor::isReductionPHI(&PN, L, RedDes)) {
-            Remark("❌ unsupported loop-carried dependency");
-            return false;
-        }
-        Value *InitVal = PN.getIncomingValueForBlock(L->getLoopPreheader());
-        auto *Update = cast<Instruction>(PN.getIncomingValueForBlock(L->getLoopLatch()));
-        LC.Reductions.push_back({&PN, InitVal, Update});
-    }
-
-    // Reject reductions whose accumulator is stored to non-local memory
-    // (e.g. prefix sum: arr[i] = running_total).
-    if (!LC.Reductions.empty()) {
-        SmallPtrSet<Value *, 4> RedVals;
-        for (auto &R : LC.Reductions) {
-            RedVals.insert(R.Phi);
-            RedVals.insert(R.Update);
-        }
-        for (BasicBlock *BB : L->blocks()) {
-            for (Instruction &I : *BB) {
-                auto *SI = dyn_cast<StoreInst>(&I);
-                if (SI && RedVals.count(SI->getValueOperand())) {
-                    Remark("❌ reduction value stored to memory");
-                    return false;
-                }
-            }
-        }
-    }
-
-    for (Instruction &AI : F.getEntryBlock()) {
-        auto *Alloca = dyn_cast<AllocaInst>(&AI);
-        if (!Alloca || Alloca->user_empty()) {
-            continue;
-        }
-        bool AllInLoop = llvm::all_of(Alloca->users(), [&](User *U) {
-            auto *UI = dyn_cast<Instruction>(U);
-            return UI && L->contains(UI->getParent());
-        });
-        if (AllInLoop) {
-            LC.LoopLocalAllocas.insert(Alloca);
-        }
-    }
-
-    // Reject atomics and any call that accesses memory.
-    for (BasicBlock *BB : L->blocks()) {
-        for (Instruction &I : *BB) {
-            if (I.isAtomic()) {
-                Remark("❌ loop contains atomic instructions");
-                return false;
-            }
-            auto *CB = dyn_cast<CallBase>(&I);
-            if (!CB) {
-                continue;
-            }
-            if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-                if (II->isLifetimeStartOrEnd() || II->isDebugOrPseudoInst()) {
-                    continue;
-                }
-            }
-            if (CB->doesNotAccessMemory() || CB->getMemoryEffects().onlyAccessesInaccessibleMem()) {
-                continue;
-            }
-            Remark("❌ call with side effects");
-            return false;
-        }
-    }
-
-    // Memory dependence checking via LoopAccessInfo.
-    if (!LAI.canVectorizeMemory() || LAI.getNumRuntimePointerChecks() > 0) {
-        Remark("❌ unsafe memory dependence");
-        return false;
-    }
-
-    // Reject if non-reduction loop-variant values escape via LCSSA PHIs.
-    {
-        SmallPtrSet<Value *, 4> RedVals;
-        for (auto &R : LC.Reductions) {
-            RedVals.insert(R.Phi);
-            RedVals.insert(R.Update);
-        }
-        for (PHINode &PN : LC.ExitBlock->phis()) {
-            for (unsigned i = 0; i < PN.getNumIncomingValues(); ++i) {
-                auto *I = dyn_cast<Instruction>(PN.getIncomingValue(i));
-                if (I && L->contains(I->getParent()) && !RedVals.count(I)) {
-                    Remark("❌ non-reduction value escapes loop");
-                    return false;
-                }
-            }
-        }
-    }
-
-    return true;
 }
 
 static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolution &SE,
-                            const LoopAccessInfo &LAI, Function &F, auto &Remark) {
+                            LoopAccessInfoManager &LAM, Function &F,
+                            OptimizationRemarkEmitter &ORE, bool SuppressRemarks,
+                            SmallPtrSetImpl<Loop *> &SkipLoops) {
+    auto Remark = [&](Loop *Target, StringRef Msg) {
+        if (SuppressRemarks)
+            return;
+        ORE.emit([&]() {
+            return OptimizationRemarkAnalysis(DEBUG_TYPE, "LoopParallelize",
+                                              Target->getStartLoc(), Target->getHeader())
+                   << Msg;
+        });
+    };
+    auto RemarkAt = [&](StringRef Msg) { Remark(L, Msg); };
+
     LoopCandidate LC;
-    if (!checkStructure(L, SE, LC, Remark)) {
+    if (!checkStructure(L, SE, LC, RemarkAt))
         return false;
-    }
-    if (!checkSafety(L, F, LC, LAI, Remark)) {
+
+    Loop *OutermostL = L;
+    detectCollapse(L, SE, LC, OutermostL);
+
+    const LoopAccessInfo &LAI = LAM.getInfo(*L);
+    if (!checkSafety(L, OutermostL, F, LC, &LAI, RemarkAt))
         return false;
-    }
 
-    if (LC.Reductions.empty()) {
-        Remark("✅ #omp parallel for simd");
-    } else {
-        Remark("✅ #omp parallel for simd reduction");
-    }
+    // If collapse didn't fire, try promoting to a larger outer loop.
+    if (LC.OuterLevels.empty())
+        tryPromotion(L, OutermostL, LC, SE, F);
 
-    return emitParallelLoop(L, LC, OMPBuilder, F);
+    // Mark all subloops as consumed so the worklist skips them.
+    for (auto *Sub : depth_first(OutermostL))
+        if (Sub != OutermostL)
+            SkipLoops.insert(Sub);
+
+    // Emit remark at the outermost parallelized loop's location.
+    unsigned Depth = LC.OuterLevels.size() + 1;
+    if (LC.Reductions.empty() && Depth == 1)
+        Remark(OutermostL, "✅ #omp parallel for simd");
+    else if (LC.Reductions.empty())
+        Remark(OutermostL,
+               ("✅ #omp parallel for simd collapse(" + Twine(Depth) + ")").str());
+    else
+        Remark(OutermostL, "✅ #omp parallel for simd reduction");
+
+    return emitParallelLoop(L, OutermostL, LC, OMPBuilder, F);
 }
 
 PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -197,33 +93,22 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
     OMPBuilder.initialize();
 
     SmallVector<Loop *, 8> Worklist;
-    for (auto *TopLoop : LI) {
-        for (auto *L : depth_first(TopLoop)) {
-            if (L->isInnermost()) {
+    for (auto *TopLoop : LI)
+        for (auto *L : depth_first(TopLoop))
+            if (L->isInnermost())
                 Worklist.push_back(L);
-            }
-        }
-    }
+
     bool Changed = false;
+    SmallPtrSet<Loop *, 8> SkipLoops;
 
     for (Loop *L : Worklist) {
-        auto Remark = [&](StringRef Msg) {
-            if (hadRemark) {
-                return;
-            }
-            ORE.emit([&]() {
-                return OptimizationRemarkAnalysis(DEBUG_TYPE, "LoopParallelize", L->getStartLoc(),
-                                                  L->getHeader())
-                       << Msg;
-            });
-        };
-        const LoopAccessInfo &LAI = LAM.getInfo(*L);
-        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAI, F, Remark);
+        if (SkipLoops.count(L))
+            continue;
+        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAM, F, ORE, hadRemark, SkipLoops);
     }
 
-    if (Changed) {
+    if (Changed)
         OMPBuilder.finalize();
-    }
 
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

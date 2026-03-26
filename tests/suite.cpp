@@ -97,6 +97,63 @@ TEST_F(LoopTest, GlobalIndexedWrite) {
     verify_hash(compute_hash(g_output, N), 8024147421901249633ULL, "GlobalIndexedWrite");
 }
 
+// ---- Collapse ----
+
+TEST_F(LoopTest, ScaleMatrix) {
+    constexpr int M = 1000, K = 1000;
+    auto data = rand_ints(M * K);
+    auto ref = data;
+    for (int i = 0; i < M * K; ++i) {
+        ref[i] *= 7;
+    }
+    scale_matrix(data.data(), M, K, 7);
+    EXPECT_EQ(data, ref);
+}
+
+TEST_F(LoopTest, FillMatrix) {
+    constexpr int M = 1000, K = 1000;
+    std::vector<int> data(M * K, -1);
+    fill_matrix(data.data(), M, K);
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < K; ++j) {
+            ASSERT_EQ(data[i * K + j], i * 1000 + j) << "at (" << i << "," << j << ")";
+        }
+    }
+}
+
+TEST_F(LoopTest, AddMatrices) {
+    constexpr int M = 1000, K = 1000;
+    auto A = rand_ints(M * K);
+    auto B = rand_ints(M * K);
+    std::vector<int> C(M * K);
+    std::vector<int> ref(M * K);
+    for (int i = 0; i < M * K; ++i) {
+        ref[i] = A[i] + B[i];
+    }
+    add_matrices(C.data(), A.data(), B.data(), M, K);
+    EXPECT_EQ(C, ref);
+}
+
+// ---- Promotion (outer loop parallelized) ----
+
+TEST_F(LoopTest, MatrixVector) {
+    constexpr int K = 500;
+    auto A = rand_doubles(K * K);
+    auto B = rand_doubles(K);
+    std::vector<double> C(K), ref(K);
+    for (int i = 0; i < K; ++i) {
+        double sum = 0.0;
+        for (int j = 0; j < K; ++j) {
+            sum += A[i * K + j] * B[j];
+        }
+        ref[i] = sum;
+    }
+    matrix_vector(C.data(), A.data(), B.data(), K);
+    for (int i = 0; i < K; ++i) {
+        EXPECT_NEAR(C[i], ref[i], std::abs(ref[i]) * 1e-10) << "row " << i;
+    }
+}
+
 // ---- Not-parallel loops (must produce correct sequential results) ----
 
 TEST_F(LoopTest, InterDependentReductions) {

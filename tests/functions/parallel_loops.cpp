@@ -94,6 +94,36 @@ void global_indexed_write(int *data, int N) {
     }
 }
 
+// ======= Matrices =======
+
+void fill_matrix(int *data, int M, int N) {
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            data[i * N + j] = i * 1000 + j;
+        }
+    }
+}
+
+void add_matrices(int *__restrict__ C, const int *__restrict__ A, const int *__restrict__ B, int M,
+                  int N) {
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            C[i * N + j] = A[i * N + j] + B[i * N + j];
+        }
+    }
+}
+
+void matrix_vector(double *__restrict__ C, const double *__restrict__ A,
+                   const double *__restrict__ B, int N) {
+    for (int i = 0; i < N; ++i) {
+        double sum = 0.0;
+        for (int j = 0; j < N; ++j) {
+            sum += A[i * N + j] * B[j];
+        }
+        C[i] = sum;
+    }
+}
+
 // ======= Heavy computation =======
 
 double do_heavy_math(double input, int iterations = 20) noexcept {
