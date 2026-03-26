@@ -29,16 +29,15 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                         return false;
                     });
 
-                // 'clang -fpass-plugin' support
-                PB.registerOptimizerLastEPCallback(
-                    [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
+                // 'clang -fpass-plugin' support — run before the vectorizer
+                // so we see clean, unvectorized loops.
+                PB.registerVectorizerStartEPCallback(
+                    [](FunctionPassManager &FPM, OptimizationLevel Level) {
                         if (Level != OptimizationLevel::O0) {
-                            FunctionPassManager FPM;
                             FPM.addPass(LoopSimplifyPass());
                             FPM.addPass(RequireAnalysisPass<LoopAnalysis, Function>());
                             FPM.addPass(RequireAnalysisPass<LoopAccessAnalysis, Function>());
                             FPM.addPass(AutoOMPPass());
-                            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
                         }
                     });
             }};
