@@ -10,6 +10,11 @@ fonts:
   mono: JetBrains Mono
 drag:
   grid: [10, 10]
+vite:
+  server:
+    fs:
+      allow:
+        - /Users/alex/.npm/_npx
 ---
 
 <style>
@@ -52,9 +57,9 @@ Automatic Parallelization of Loops in LLVM
 
 **02** Design
 
-**03** Performance
+**03** Live demo
 
-**04** Live demo
+**04** Performance 
 
 **05** Future work
 
@@ -78,11 +83,11 @@ Writing parallel code is hard:
 
 <br><br>
 
-<p class="text-slate-600">
+<div class="text-slate-600">
 
 Mistakes don't crash, they silently corrupt results.
 
-</p>
+</div>
 
 </div>
 
@@ -133,11 +138,11 @@ Instead of relying on the Control Flow Graph (CFG), Polly converts code into **l
 
 <br>
 
-<p class="text-sm text-slate-600">
+<div class="text-sm text-slate-600">
 
 By analyzing the `CFG` and LLVM Attributes directly, we are significantly **less restrictive**.
 
-</p>  
+</div>
 
 ---
 
@@ -265,7 +270,22 @@ Unlike `#pragma omp` which handles the heavy lifting in source code, `OMPIRBuild
 
 ---
 
-# [03] Performance
+# [03] <span class="accent">Live</span> Demo
+
+<div class="absolute top-50 right-25 w-40 text-center group">
+  <img 
+    src="https://upload.wikimedia.org/wikipedia/commons/b/b8/ISO_7010_M020.svg" 
+    alt="Fasten Seatbelt"
+    class="w-full transition-transform duration-500"
+  />
+  <p class="text-[10px] font-mono mt-4 text-slate-400 font-bold uppercase tracking-[0.2em]">
+    Checking...
+  </p>
+</div>
+
+---
+
+# [04] Performance
 
 <div class="flex justify-center mt-6">
 
@@ -280,20 +300,6 @@ Unlike `#pragma omp` which handles the heavy lifting in source code, `OMPIRBuild
 <style scoped>
   .accent { color: var(--accent); font-weight: 600; }
 </style>
-
-# [04] <span class="accent">Live</span> Demo
-
-<div class="absolute top-50 right-25 w-40 text-center group">
-  <img 
-    src="https://upload.wikimedia.org/wikipedia/commons/b/b8/ISO_7010_M020.svg" 
-    alt="Fasten Seatbelt"
-    class="w-full transition-transform duration-500"
-  />
-  <p class="text-[10px] font-mono mt-4 text-slate-400 font-bold uppercase tracking-[0.2em]">
-    Checking...
-  </p>
-</div>
----
 
 # [05] <span class="accent">Future</span> Work
 
