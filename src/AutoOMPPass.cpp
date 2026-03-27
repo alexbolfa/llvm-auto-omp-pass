@@ -68,13 +68,12 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
 
     // Emit remark at the outermost parallelized loop's location.
     unsigned Depth = LC.OuterLevels.size() + 1;
-    if (LC.Reductions.empty() && Depth == 1)
-        Remark(OutermostL, "✅ #omp parallel for simd");
-    else if (LC.Reductions.empty())
-        Remark(OutermostL,
-               ("✅ #omp parallel for simd collapse(" + Twine(Depth) + ")").str());
-    else
-        Remark(OutermostL, "✅ #omp parallel for simd reduction");
+    std::string Tag = "✅ #omp parallel for simd";
+    if (Depth > 1)
+        Tag += " collapse(" + std::to_string(Depth) + ")";
+    if (!LC.Reductions.empty())
+        Tag += " reduction";
+    Remark(OutermostL, Tag);
 
     return emitParallelLoop(L, OutermostL, LC, OMPBuilder, F);
 }

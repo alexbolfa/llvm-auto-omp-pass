@@ -97,6 +97,48 @@ TEST_F(LoopTest, GlobalIndexedWrite) {
     verify_hash(compute_hash(g_output, N), 8024147421901249633ULL, "GlobalIndexedWrite");
 }
 
+// ---- SIMD reductions ----
+
+TEST_F(LoopTest, DotProduct) {
+    auto a = rand_doubles(N);
+    auto b = rand_doubles(N);
+    double expected = 0.0;
+    for (int i = 0; i < N; ++i)
+        expected += a[i] * b[i];
+    double actual = dot_product(a.data(), b.data(), N);
+    EXPECT_NEAR(actual, expected, std::abs(expected) * 1e-10);
+}
+
+TEST_F(LoopTest, FpProduct) {
+    // Use small values near 1.0 to avoid overflow/underflow.
+    auto data = rand_doubles(N, 0.999, 1.001);
+    double expected = 1.0;
+    for (int i = 0; i < N; ++i)
+        expected *= data[i];
+    double actual = fp_product(data.data(), N);
+    EXPECT_NEAR(actual, expected, std::abs(expected) * 1e-6);
+}
+
+TEST_F(LoopTest, FindMax) {
+    auto data = rand_ints(N);
+    int expected = *std::max_element(data.begin(), data.end());
+    EXPECT_EQ(find_max(data.data(), N), expected);
+}
+
+TEST_F(LoopTest, FindMin) {
+    auto data = rand_ints(N);
+    int expected = *std::min_element(data.begin(), data.end());
+    EXPECT_EQ(find_min(data.data(), N), expected);
+}
+
+TEST_F(LoopTest, BitwiseOrReduce) {
+    auto data = rand_ints(N, 0, 255);
+    int expected = 0;
+    for (int i = 0; i < N; ++i)
+        expected |= data[i];
+    EXPECT_EQ(bitwise_or_reduce(data.data(), N), expected);
+}
+
 // ---- Collapse ----
 
 TEST_F(LoopTest, ScaleMatrix) {

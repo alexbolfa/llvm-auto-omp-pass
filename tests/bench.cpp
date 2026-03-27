@@ -47,6 +47,25 @@ void image_brighten(int *__restrict__ out, const int *__restrict__ in, int N, in
     }
 }
 
+__attribute__((noinline)) double dot_product_bench(const double *__restrict__ a,
+                                                   const double *__restrict__ b, int N) {
+    double sum = 0.0;
+    for (int i = 0; i < N; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+__attribute__((noinline)) int find_max_bench(const int *data, int N) {
+    int mx = data[0];
+    for (int i = 1; i < N; ++i) {
+        if (data[i] > mx) {
+            mx = data[i];
+        }
+    }
+    return mx;
+}
+
 // ---- Fixtures ----
 
 class ImageBrightenBench : public benchmark::Fixture {
@@ -115,6 +134,42 @@ class PhysicsSimBench : public benchmark::Fixture {
     }
 };
 
+class DotProductBench : public benchmark::Fixture {
+  public:
+    static constexpr int N = 20'000'000;
+    std::vector<double> a;
+    std::vector<double> b;
+
+    void SetUp(benchmark::State &) override {
+        a.resize(N);
+        b.resize(N);
+        for (int i = 0; i < N; ++i) {
+            a[i] = 0.001 * (i % 1000);
+            b[i] = 0.002 * ((i + 500) % 1000);
+        }
+    }
+
+    void TearDown(benchmark::State &) override {
+        a.clear();
+        b.clear();
+    }
+};
+
+class FindMaxBench : public benchmark::Fixture {
+  public:
+    static constexpr int N = 20'000'000;
+    std::vector<int> data;
+
+    void SetUp(benchmark::State &) override {
+        data.resize(N);
+        for (int i = 0; i < N; ++i) {
+            data[i] = (i * 2654435761u) % N; // pseudo-random scatter
+        }
+    }
+
+    void TearDown(benchmark::State &) override { data.clear(); }
+};
+
 // ---- Benchmarks ----
 
 BENCHMARK_F(ImageBrightenBench, Run)(benchmark::State &state) {
@@ -135,6 +190,18 @@ BENCHMARK_F(PhysicsSimBench, Run)(benchmark::State &state) {
     for (auto _ : state) {
         physics_sim(out.data(), in.data(), N);
         benchmark::DoNotOptimize(out[N / 2]);
+    }
+}
+
+BENCHMARK_F(DotProductBench, Run)(benchmark::State &state) {
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(dot_product_bench(a.data(), b.data(), N));
+    }
+}
+
+BENCHMARK_F(FindMaxBench, Run)(benchmark::State &state) {
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(find_max_bench(data.data(), N));
     }
 }
 

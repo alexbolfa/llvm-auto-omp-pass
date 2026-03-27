@@ -124,6 +124,42 @@ void matrix_vector(double *__restrict__ C, const double *__restrict__ A,
     }
 }
 
+// ======= SIMD reductions =======
+
+double dot_product(const double *__restrict__ a, const double *__restrict__ b, int N) {
+    double sum = 0.0;
+    for (int i = 0; i < N; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+int find_max(const int *data, int N) {
+    int mx = data[0];
+    for (int i = 1; i < N; ++i) {
+        if (data[i] > mx)
+            mx = data[i];
+    }
+    return mx;
+}
+
+int find_min(const int *data, int N) {
+    int mn = data[0];
+    for (int i = 1; i < N; ++i) {
+        if (data[i] < mn)
+            mn = data[i];
+    }
+    return mn;
+}
+
+int bitwise_or_reduce(const int *data, int N) {
+    int result = 0;
+    for (int i = 0; i < N; ++i) {
+        result |= data[i];
+    }
+    return result;
+}
+
 // ======= Heavy computation =======
 
 double do_heavy_math(double input, int iterations = 20) noexcept {

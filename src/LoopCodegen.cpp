@@ -146,7 +146,16 @@ static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *He
 // Parallel loop emission
 // ===----------------------------------------------------------------------===//
 
-/// Apply SIMD (when no reductions) and workshare to a canonical loop.
+static void addVectorizeHint(CanonicalLoopInfo *CLI, LLVMContext &Ctx) {
+    auto *Latch = CLI->getLatch();
+    auto *Term = Latch->getTerminator();
+    MDNode *VecEnable = MDNode::get(Ctx, {MDString::get(Ctx, "llvm.loop.vectorize.enable"),
+                                          ConstantAsMetadata::get(ConstantInt::getTrue(Ctx))});
+    MDNode *LoopID = MDNode::get(Ctx, {nullptr, VecEnable});
+    LoopID->replaceOperandWith(0, LoopID); // self-reference
+    Term->setMetadata(LLVMContext::MD_loop, LoopID);
+}
+
 static Error finalizeLoop(CanonicalLoopInfo *CLI, OpenMPIRBuilder &OMPBuilder, DebugLoc DL,
                           bool HasReductions, OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
                           OpenMPIRBuilder::InsertPointTy &SavedBodyIP,
@@ -154,6 +163,9 @@ static Error finalizeLoop(CanonicalLoopInfo *CLI, OpenMPIRBuilder &OMPBuilder, D
     if (!HasReductions)
         OMPBuilder.applySimd(CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
                              nullptr);
+    else {
+        addVectorizeHint(CLI, OMPBuilder.M.getContext());
+    }
     auto WS = OMPBuilder.applyWorkshareLoop(DL, CLI, InnerAllocaIP, true);
     if (!WS)
         return WS.takeError();
@@ -306,11 +318,34 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
         SmallVector<OpenMPIRBuilder::ReductionInfo, 2> OMPReds;
         SmallVector<bool, 2> IsByRef;
         for (auto &R : LC.Reductions) {
-            auto RedCB = [Opc = RecurrenceDescriptor::getOpcode(R.Kind)](
-                             OpenMPIRBuilder::InsertPointTy IP, Value *LHS, Value *RHS,
-                             Value *&Res) -> OpenMPIRBuilder::InsertPointOrErrorTy {
+            auto RedCB = [Kind = R.Kind](OpenMPIRBuilder::InsertPointTy IP, Value *LHS, Value *RHS,
+                                         Value *&Res) -> OpenMPIRBuilder::InsertPointOrErrorTy {
                 IRBuilder<> B(IP.getBlock(), IP.getPoint());
-                Res = B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opc), LHS, RHS, "red");
+                switch (Kind) {
+                case RecurKind::SMax:
+                    Res = B.CreateSelect(B.CreateICmpSGT(LHS, RHS), LHS, RHS, "red");
+                    break;
+                case RecurKind::SMin:
+                    Res = B.CreateSelect(B.CreateICmpSLT(LHS, RHS), LHS, RHS, "red");
+                    break;
+                case RecurKind::UMax:
+                    Res = B.CreateSelect(B.CreateICmpUGT(LHS, RHS), LHS, RHS, "red");
+                    break;
+                case RecurKind::UMin:
+                    Res = B.CreateSelect(B.CreateICmpULT(LHS, RHS), LHS, RHS, "red");
+                    break;
+                case RecurKind::FMax:
+                    Res = B.CreateMaxNum(LHS, RHS);
+                    break;
+                case RecurKind::FMin:
+                    Res = B.CreateMinNum(LHS, RHS);
+                    break;
+                default:
+                    Res = B.CreateBinOp(
+                        static_cast<Instruction::BinaryOps>(RecurrenceDescriptor::getOpcode(Kind)),
+                        LHS, RHS, "red");
+                    break;
+                }
                 return B.saveIP();
             };
             OMPReds.push_back({R.Phi->getType(), R.SharedAlloca, PrivatizedAllocas[R.SharedAlloca],
