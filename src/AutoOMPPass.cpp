@@ -15,14 +15,16 @@ using namespace llvm;
 
 /// After the innermost loop is verified, try promoting to a larger outer loop.
 static void tryPromotion(Loop *&L, Loop *&OutermostL, LoopCandidate &LC,
-                         ScalarEvolution &SE, Function &F) {
+                         ScalarEvolution &SE, LoopAccessInfoManager &LAM,
+                         Function &F) {
     auto Quiet = [](StringRef) {};
     Loop *Candidate = L->getParentLoop();
     while (Candidate) {
         LoopCandidate CandLC;
         if (!checkStructure(Candidate, SE, CandLC, Quiet))
             break;
-        if (!checkSafety(Candidate, Candidate, F, CandLC, nullptr, Quiet))
+        const LoopAccessInfo &LAI = LAM.getInfo(*Candidate);
+        if (!checkSafety(Candidate, Candidate, F, CandLC, &LAI, Quiet))
             break;
         OutermostL = Candidate;
         L = Candidate;
@@ -59,7 +61,7 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
 
     // If collapse didn't fire, try promoting to a larger outer loop.
     if (LC.OuterLevels.empty())
-        tryPromotion(L, OutermostL, LC, SE, F);
+        tryPromotion(L, OutermostL, LC, SE, LAM, F);
 
     // Mark all subloops as consumed so the worklist skips them.
     for (auto *Sub : depth_first(OutermostL))

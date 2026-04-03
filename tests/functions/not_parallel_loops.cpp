@@ -104,3 +104,12 @@ void small_fill(int *out) {
         out[i] = i * 3;
     }
 }
+
+void outer_carried_dep(int *data, int N, int M) {
+    for (int i = 1; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            data[i * M + j] += 1;
+        }
+        data[i] += data[i - 1];
+    }
+}

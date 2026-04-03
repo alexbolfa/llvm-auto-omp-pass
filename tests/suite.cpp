@@ -235,3 +235,17 @@ TEST_F(LoopTest, LastIterationValue) {
     int expected = data[N - 1] * 2;
     EXPECT_EQ(last_iteration_value(data.data(), N), expected);
 }
+
+TEST_F(LoopTest, OuterCarriedDep) {
+    constexpr int R = 1000, C = 1000;
+    auto data = rand_ints(R * C);
+    auto expected = data;
+    for (int i = 1; i < R; i++) {
+        for (int j = 0; j < C; j++) {
+            expected[i * C + j] += 1;
+        }
+        expected[i] += expected[i - 1];
+    }
+    outer_carried_dep(data.data(), R, C);
+    EXPECT_EQ(data, expected);
+}
