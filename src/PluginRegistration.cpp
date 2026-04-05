@@ -4,7 +4,10 @@
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 
 #if __has_include("llvm/Plugins/PassPlugin.h")
 #include "llvm/Plugins/PassPlugin.h"
@@ -16,11 +19,13 @@ using namespace llvm;
 
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "AutoOMPPass", LLVM_VERSION_STRING, [](PassBuilder &PB) {
-                // 'opt -passes=auto-omp' support
+                // Allow manual invocation via: opt -passes=auto-omp
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, FunctionPassManager &FPM, ...) {
                         if (Name == "auto-omp") {
                             FPM.addPass(LoopSimplifyPass());
+                            FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
+                            FPM.addPass(createFunctionToLoopPassAdaptor(IndVarSimplifyPass()));
                             FPM.addPass(RequireAnalysisPass<LoopAnalysis, Function>());
                             FPM.addPass(RequireAnalysisPass<LoopAccessAnalysis, Function>());
                             FPM.addPass(AutoOMPPass());
@@ -35,6 +40,8 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                     [](FunctionPassManager &FPM, OptimizationLevel Level) {
                         if (Level != OptimizationLevel::O0) {
                             FPM.addPass(LoopSimplifyPass());
+                            FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
+                            FPM.addPass(createFunctionToLoopPassAdaptor(IndVarSimplifyPass()));
                             FPM.addPass(RequireAnalysisPass<LoopAnalysis, Function>());
                             FPM.addPass(RequireAnalysisPass<LoopAccessAnalysis, Function>());
                             FPM.addPass(AutoOMPPass());
