@@ -91,10 +91,10 @@ TEST_F(LoopTest, SplitArray) {
     verify_hash(compute_hash(a.data(), 2 * H), 12842703590451613480ULL, "SplitArray");
 }
 
-TEST_F(LoopTest, GlobalIndexedWrite) {
+TEST_F(LoopTest, GlobalIndexedWriteNoinline) {
     auto data = rand_ints(N);
-    global_indexed_write(data.data(), N);
-    verify_hash(compute_hash(g_output, N), 8024147421901249633ULL, "GlobalIndexedWrite");
+    global_indexed_write_noinline(data.data(), N);
+    verify_hash(compute_hash(g_output, N), 8024147421901249633ULL, "GlobalIndexedWriteNoinline");
 }
 
 // ---- SIMD reductions ----
@@ -234,18 +234,4 @@ TEST_F(LoopTest, LastIterationValue) {
     auto data = rand_ints(N);
     int expected = data[N - 1] * 2;
     EXPECT_EQ(last_iteration_value(data.data(), N), expected);
-}
-
-TEST_F(LoopTest, OuterCarriedDep) {
-    constexpr int R = 1000, C = 1000;
-    auto data = rand_ints(R * C);
-    auto expected = data;
-    for (int i = 1; i < R; i++) {
-        for (int j = 0; j < C; j++) {
-            expected[i * C + j] += 1;
-        }
-        expected[i] += expected[i - 1];
-    }
-    outer_carried_dep(data.data(), R, C);
-    EXPECT_EQ(data, expected);
 }

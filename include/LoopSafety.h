@@ -7,10 +7,73 @@
 
 namespace llvm {
 
-/// Check that the loop body is safe to parallelize: valid reductions,
-/// no atomics, no memory-accessing calls, no unsafe memory dependencies,
-/// and no non-reduction values escaping the loop.
-/// LAI may be null during outer-loop promotion (inner memory already verified).
+/// Trace a value in the callee to determine if it depends on a function
+/// argument whose corresponding call-site operand varies with the loop IV.
+static bool hasLoopVariantArgDep(Value *V, CallBase *CB, Loop *L) {
+    SmallVector<Value *, 8> Worklist = {V};
+    SmallPtrSet<Value *, 16> Visited;
+    while (!Worklist.empty()) {
+        Value *Cur = Worklist.pop_back_val();
+        if (!Visited.insert(Cur).second) {
+            continue;
+        }
+        if (auto *A = dyn_cast<Argument>(Cur)) {
+            if (!L->isLoopInvariant(CB->getArgOperand(A->getArgNo()))) {
+                return true;
+            }
+            continue;
+        }
+        if (auto *I = dyn_cast<Instruction>(Cur)) {
+            for (Use &Op : I->operands()) {
+                Worklist.push_back(Op.get());
+            }
+        }
+    }
+    return false;
+}
+
+/// Check if a call to a module-local function is safe within a parallel loop
+/// by analyzing the callee's body.
+static bool isCallSafeForLoop(CallBase *CB, Loop *L) {
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || Callee->isDeclaration()) {
+        return false;
+    }
+    if (Callee->getInstructionCount() > 64) {
+        return false;
+    }
+    for (auto &BB : *Callee) {
+        for (auto &I : BB) {
+            if (I.isAtomic()) {
+                return false;
+            }
+            if (auto *SubCB = dyn_cast<CallBase>(&I)) {
+                if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+                    if (II->isLifetimeStartOrEnd()) {
+                        continue;
+                    }
+                }
+                if (!SubCB->doesNotAccessMemory()) {
+                    return false;
+                }
+            }
+            if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                if (SI->isVolatile()) {
+                    return false;
+                }
+                if (!hasLoopVariantArgDep(SI->getPointerOperand(), CB, L)) {
+                    return false;
+                }
+            }
+            if (isa<LoadInst>(&I)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Check that the loop body is safe to parallelize
 bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
                   const LoopAccessInfo *LAI, auto &Remark) {
     // Validate header PHIs as reductions.
@@ -33,13 +96,17 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
         RedVals.insert(R.Phi);
         RedVals.insert(R.Update);
     }
+    bool HasValidatedCalls = false;
+    bool HasExplicitStores = false;
     for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : *BB) {
-            if (auto *SI = dyn_cast<StoreInst>(&I))
+            if (auto *SI = dyn_cast<StoreInst>(&I)) {
                 if (RedVals.count(SI->getValueOperand())) {
                     Remark("❌ reduction value stored to memory");
                     return false;
                 }
+                HasExplicitStores = true;
+            }
             if (I.isAtomic()) {
                 Remark("❌ loop contains atomic instructions");
                 return false;
@@ -50,8 +117,12 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
                         continue;
                 if (!CB->doesNotAccessMemory() &&
                     !CB->getMemoryEffects().onlyAccessesInaccessibleMem()) {
-                    Remark("❌ call with side effects");
-                    return false;
+                    if (isCallSafeForLoop(CB, L)) {
+                        HasValidatedCalls = true;
+                    } else {
+                        Remark("❌ call with side effects");
+                        return false;
+                    }
                 }
             }
         }
@@ -70,7 +141,8 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
     }
 
     // Memory dependence check.
-    if (LAI && (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0)) {
+    if (LAI && (!HasValidatedCalls || HasExplicitStores) &&
+        (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0)) {
         Remark("❌ unsafe memory dependence");
         return false;
     }

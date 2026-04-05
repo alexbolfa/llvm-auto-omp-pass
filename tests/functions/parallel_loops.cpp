@@ -86,11 +86,13 @@ void split_array(int *a, int N) {
 
 int g_output[1000000];
 
-static void update_global_at(int idx, int val) { g_output[idx] = val; }
+__attribute__((noinline)) static void update_global_noinline(int idx, int val) {
+    g_output[idx] = val;
+}
 
-void global_indexed_write(int *data, int N) {
+void global_indexed_write_noinline(int *data, int N) {
     for (int i = 0; i < N; ++i) {
-        update_global_at(i, data[i] * 2);
+        update_global_noinline(i, data[i] * 2);
     }
 }
 

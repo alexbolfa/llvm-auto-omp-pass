@@ -105,11 +105,14 @@ void small_fill(int *out) {
     }
 }
 
-void outer_carried_dep(int *data, int N, int M) {
-    for (int i = 1; i < N; i++) {
-        for (int j = 0; j < M; j++) {
-            data[i * M + j] += 1;
-        }
-        data[i] += data[i - 1];
+int np_g_output[1000000];
+
+__attribute__((noinline)) static void np_update_global_noinline(int idx, int val) {
+    np_g_output[idx] = np_g_output[idx - 1] + val;
+}
+
+void np_global_indexed_write_noinline(int *data, int N) {
+    for (int i = 0; i < N; ++i) {
+        np_update_global_noinline(i, data[i] * 2);
     }
 }

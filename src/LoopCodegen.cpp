@@ -30,9 +30,10 @@ static Value *computeTripCount(IRBuilder<> &B, const LoopLevel &Lev, Type *IdxTy
         Span = B.CreateAdd(Span, ConstantInt::get(IdxTy, 1));
     Value *TC = B.CreateAdd(B.CreateUDiv(B.CreateSub(Span, ConstantInt::get(IdxTy, 1)), Step),
                             ConstantInt::get(IdxTy, 1));
-    Value *Empty = Lev.Inclusive
-                       ? (Lev.IsSigned ? B.CreateICmpSLT(Stop, Start) : B.CreateICmpULT(Stop, Start))
-                       : (Lev.IsSigned ? B.CreateICmpSLE(Stop, Start) : B.CreateICmpULE(Stop, Start));
+    auto EmptyPred = Lev.Inclusive
+                         ? (Lev.IsSigned ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_ULT)
+                         : (Lev.IsSigned ? ICmpInst::ICMP_SLE : ICmpInst::ICMP_ULE);
+    Value *Empty = B.CreateICmp(EmptyPred, Stop, Start);
     return B.CreateSelect(Empty, ConstantInt::get(IdxTy, 0), TC);
 }
 
@@ -163,9 +164,8 @@ static Error finalizeLoop(CanonicalLoopInfo *CLI, OpenMPIRBuilder &OMPBuilder, D
     if (!HasReductions)
         OMPBuilder.applySimd(CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
                              nullptr);
-    else {
+    else
         addVectorizeHint(CLI, OMPBuilder.M.getContext());
-    }
     auto WS = OMPBuilder.applyWorkshareLoop(DL, CLI, InnerAllocaIP, true);
     if (!WS)
         return WS.takeError();
@@ -192,18 +192,17 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
     }
 
     SmallVector<std::pair<Use *, ReductionInfo *>, 4> ExternalRedUses;
-    for (auto &R : LC.Reductions)
-        for (Value *V : {static_cast<Value *>(R.Update), static_cast<Value *>(R.Phi)})
-            for (Use &U : V->uses())
-                if (!OutermostL->contains(cast<Instruction>(U.getUser())->getParent()))
-                    ExternalRedUses.push_back({&U, &R});
-
-    // Remove non-reduction LCSSA PHIs in the exit block.
     SmallPtrSet<Value *, 4> RedValues;
     for (auto &R : LC.Reductions) {
         RedValues.insert(R.Phi);
         RedValues.insert(R.Update);
+        for (Value *V : {static_cast<Value *>(R.Update), static_cast<Value *>(R.Phi)})
+            for (Use &U : V->uses())
+                if (!OutermostL->contains(cast<Instruction>(U.getUser())->getParent()))
+                    ExternalRedUses.push_back({&U, &R});
     }
+
+    // Remove non-reduction LCSSA PHIs in the exit block.
     for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis()))
         if (!any_of(PN.incoming_values(), [&](Value *V) { return RedValues.count(V); })) {
             PN.replaceAllUsesWith(PN.getIncomingValue(0));
@@ -323,22 +322,22 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
                 IRBuilder<> B(IP.getBlock(), IP.getPoint());
                 switch (Kind) {
                 case RecurKind::SMax:
-                    Res = B.CreateSelect(B.CreateICmpSGT(LHS, RHS), LHS, RHS, "red");
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::smax, LHS, RHS);
                     break;
                 case RecurKind::SMin:
-                    Res = B.CreateSelect(B.CreateICmpSLT(LHS, RHS), LHS, RHS, "red");
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::smin, LHS, RHS);
                     break;
                 case RecurKind::UMax:
-                    Res = B.CreateSelect(B.CreateICmpUGT(LHS, RHS), LHS, RHS, "red");
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::umax, LHS, RHS);
                     break;
                 case RecurKind::UMin:
-                    Res = B.CreateSelect(B.CreateICmpULT(LHS, RHS), LHS, RHS, "red");
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::umin, LHS, RHS);
                     break;
                 case RecurKind::FMax:
-                    Res = B.CreateMaxNum(LHS, RHS);
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::maxnum, LHS, RHS);
                     break;
                 case RecurKind::FMin:
-                    Res = B.CreateMinNum(LHS, RHS);
+                    Res = B.CreateBinaryIntrinsic(Intrinsic::minnum, LHS, RHS);
                     break;
                 default:
                     Res = B.CreateBinOp(
