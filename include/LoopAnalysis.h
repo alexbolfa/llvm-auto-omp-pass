@@ -50,8 +50,8 @@ bool checkStructure(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, auto &Remar
         }
     }
 
-    if (MemOps > 0 && ArithOps <= MemOps) {
-        Remark("❌ loop is memory-bound (too few arithmetic ops per memory access)");
+    if (MemOps > 0 && ArithOps <= MemOps && L->isInnermost()) {
+        Remark("❌ loop is memory-bound");
         return false;
     }
 

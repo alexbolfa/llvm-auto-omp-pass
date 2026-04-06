@@ -30,7 +30,7 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
     bool Validated = false;
     auto MaybeRemark = [&](StringRef Msg) {
         if (!Validated)
-            Remark(L, Msg);
+            Remark(Candidate, Msg);
     };
     do {
         LoopCandidate CandLC;
