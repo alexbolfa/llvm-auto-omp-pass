@@ -1,19 +1,15 @@
 #include "LoopCodegen.h"
 
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 using namespace llvm;
 
 // ===----------------------------------------------------------------------===//
 // Helpers
 // ===----------------------------------------------------------------------===//
-
-static void remapOperands(Instruction *I, DenseMap<Value *, Value *> &VMap) {
-    for (unsigned i = 0, e = I->getNumOperands(); i < e; ++i)
-        if (auto It = VMap.find(I->getOperand(i)); It != VMap.end())
-            I->setOperand(i, It->second);
-}
 
 static Value *computeTripCount(OpenMPIRBuilder &OMPBuilder, const LoopLevel &Lev, DebugLoc DL,
                                BasicBlock *InsertBB) {
@@ -25,7 +21,7 @@ static Value *computeTripCount(OpenMPIRBuilder &OMPBuilder, const LoopLevel &Lev
 
 /// Derive individual IVs from a collapsed iteration index K via div/rem.
 static void deriveCollapsedIVs(IRBuilder<> &B, Value *K, ArrayRef<LoopLevel> Levels,
-                               ArrayRef<Value *> TripCounts, DenseMap<Value *, Value *> &VMap) {
+                               ArrayRef<Value *> TripCounts, ValueToValueMapTy &VMap) {
     Value *Rem = K;
     for (int i = Levels.size() - 1; i >= 0; --i) {
         Value *Idx = (i == 0) ? Rem : B.CreateURem(Rem, TripCounts[i]);
@@ -43,7 +39,7 @@ static void deriveCollapsedIVs(IRBuilder<> &B, Value *K, ArrayRef<LoopLevel> Lev
 /// body, so the inner loop body can reference them (e.g. GEPs using outer IVs).
 static void cloneOuterBlockValues(ArrayRef<BasicBlock *> AllNestBlocks,
                                   ArrayRef<BasicBlock *> InnerBlocks, BasicBlock *BodyBB,
-                                  DenseMap<Value *, Value *> &VMap) {
+                                  ValueToValueMapTy &VMap) {
     SmallPtrSet<BasicBlock *, 8> InnerSet(InnerBlocks.begin(), InnerBlocks.end());
     SmallVector<Instruction *, 16> Clones;
     for (auto *BB : AllNestBlocks) {
@@ -60,7 +56,7 @@ static void cloneOuterBlockValues(ArrayRef<BasicBlock *> AllNestBlocks,
         }
     }
     for (auto *C : Clones)
-        remapOperands(C, VMap);
+        RemapInstruction(C, VMap, RF_IgnoreMissingLocals);
 }
 
 // ===----------------------------------------------------------------------===//
@@ -71,7 +67,7 @@ static void cloneOuterBlockValues(ArrayRef<BasicBlock *> AllNestBlocks,
 /// reduction loads/stores at header entry and latch exit.
 static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *Header,
                                 BasicBlock *Latch, BasicBlock *BodyBB, BasicBlock *ContinueBB,
-                                DenseMap<Value *, Value *> &VMap, Function &F,
+                                ValueToValueMapTy &VMap, Function &F,
                                 ArrayRef<ReductionInfo> Reductions) {
     DenseMap<BasicBlock *, BasicBlock *> BBMap;
     for (auto *BB : SrcBlocks)
@@ -98,7 +94,7 @@ static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *He
     // Remap operands and PHI incoming blocks.
     for (auto *BB : SrcBlocks)
         for (Instruction &I : *BBMap[BB]) {
-            remapOperands(&I, VMap);
+            RemapInstruction(&I, VMap, RF_IgnoreMissingLocals);
             if (auto *PN = dyn_cast<PHINode>(&I))
                 for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
                     if (auto It = BBMap.find(PN->getIncomingBlock(i)); It != BBMap.end())
@@ -116,7 +112,7 @@ static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *He
             BranchInst::Create(ContinueBB, BBMap[BB]);
         } else {
             auto *T = BB->getTerminator()->clone();
-            remapOperands(T, VMap);
+            RemapInstruction(T, VMap, RF_IgnoreMissingLocals);
             for (unsigned i = 0; i < T->getNumSuccessors(); ++i) {
                 auto It = BBMap.find(T->getSuccessor(i));
                 T->setSuccessor(i, It != BBMap.end() ? It->second : ContinueBB);
@@ -211,7 +207,7 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
     // --- Body generation ---
     auto BodyGenCB = [&](OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
                          OpenMPIRBuilder::InsertPointTy CodeGenIP) -> Error {
-        auto CloneBody = [&](OpenMPIRBuilder::InsertPointTy BodyIP, DenseMap<Value *, Value *> &VMap) {
+        auto CloneBody = [&](OpenMPIRBuilder::InsertPointTy BodyIP, ValueToValueMapTy &VMap) {
             if (!LC.OuterLevels.empty())
                 cloneOuterBlockValues(AllNestBlocks, InnerLoopBlocks, BodyIP.getBlock(), VMap);
             cloneLoopBodyBlocks(InnerLoopBlocks, LC.Header, LC.Latch, BodyIP.getBlock(),
@@ -223,7 +219,7 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
             if (LC.OuterLevels.empty()) {
                 auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP,
                                       Value *NewIV) -> Error {
-                    DenseMap<Value *, Value *> VMap;
+                    ValueToValueMapTy VMap;
                     VMap[Bnd.IV] = NewIV;
                     CloneBody(BodyIP, VMap);
                     return Error::success();
@@ -265,7 +261,7 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
 
             auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP, Value *K) -> Error {
                 IRBuilder<> B(BodyIP.getBlock(), BodyIP.getPoint());
-                DenseMap<Value *, Value *> VMap;
+                ValueToValueMapTy VMap;
                 deriveCollapsedIVs(B, K, AllLevels, TripCounts, VMap);
                 CloneBody(BodyIP, VMap);
                 return Error::success();
@@ -375,11 +371,7 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
             U->set(FinalVals[R]);
     }
 
-    for (PHINode &PN : make_early_inc_range(LC.ExitBlock->phis()))
-        if (PN.getNumIncomingValues() == 1) {
-            PN.replaceAllUsesWith(PN.getIncomingValue(0));
-            PN.eraseFromParent();
-        }
+    FoldSingleEntryPHINodes(LC.ExitBlock);
 
     if (!AfterBB->getTerminator())
         BranchInst::Create(LC.ExitBlock, AfterBB);
