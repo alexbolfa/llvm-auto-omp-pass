@@ -72,6 +72,7 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
         Tag += " collapse(" + std::to_string(Depth) + ")";
     if (!LC.Reductions.empty())
         Tag += " reduction";
+    Tag += " in " + F.getName().str();
     Remark(OutermostL, Tag);
 
     return emitParallelLoop(L, OutermostL, LC, OMPBuilder, F);

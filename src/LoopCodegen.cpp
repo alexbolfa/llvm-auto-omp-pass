@@ -129,25 +129,10 @@ static void cloneLoopBodyBlocks(ArrayRef<BasicBlock *> SrcBlocks, BasicBlock *He
 // Parallel loop emission
 // ===----------------------------------------------------------------------===//
 
-static void addVectorizeHint(CanonicalLoopInfo *CLI, LLVMContext &Ctx) {
-    auto *Latch = CLI->getLatch();
-    auto *Term = Latch->getTerminator();
-    MDNode *VecEnable = MDNode::get(Ctx, {MDString::get(Ctx, "llvm.loop.vectorize.enable"),
-                                          ConstantAsMetadata::get(ConstantInt::getTrue(Ctx))});
-    MDNode *LoopID = MDNode::get(Ctx, {nullptr, VecEnable});
-    LoopID->replaceOperandWith(0, LoopID); // self-reference
-    Term->setMetadata(LLVMContext::MD_loop, LoopID);
-}
-
 static Error finalizeLoop(CanonicalLoopInfo *CLI, OpenMPIRBuilder &OMPBuilder, DebugLoc DL,
-                          bool HasReductions, OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
+                          OpenMPIRBuilder::InsertPointTy InnerAllocaIP,
                           OpenMPIRBuilder::InsertPointTy &SavedBodyIP,
                           OpenMPIRBuilder::InsertPointTy &SavedBodyAllocaIP) {
-    if (!HasReductions)
-        OMPBuilder.applySimd(CLI, {}, nullptr, omp::OrderKind::OMP_ORDER_concurrent, nullptr,
-                             nullptr);
-    else
-        addVectorizeHint(CLI, OMPBuilder.M.getContext());
     auto WS = OMPBuilder.applyWorkshareLoop(DL, CLI, InnerAllocaIP, true);
     if (!WS)
         return WS.takeError();
@@ -271,7 +256,7 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
 
         if (!CLI)
             return CLI.takeError();
-        return finalizeLoop(*CLI, OMPBuilder, DL, !LC.Reductions.empty(), InnerAllocaIP,
+        return finalizeLoop(*CLI, OMPBuilder, DL, InnerAllocaIP,
                             SavedBodyIP, SavedBodyAllocaIP);
     };
 

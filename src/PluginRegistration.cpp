@@ -34,18 +34,17 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                         return false;
                     });
 
-                // 'clang -fpass-plugin' support — run before the vectorizer
-                // so we see clean, unvectorized loops.
-                PB.registerVectorizerStartEPCallback(
-                    [](FunctionPassManager &FPM, OptimizationLevel Level) {
-                        if (Level != OptimizationLevel::O0) {
-                            FPM.addPass(LoopSimplifyPass());
-                            FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
-                            FPM.addPass(createFunctionToLoopPassAdaptor(IndVarSimplifyPass()));
-                            FPM.addPass(RequireAnalysisPass<LoopAnalysis, Function>());
-                            FPM.addPass(RequireAnalysisPass<LoopAccessAnalysis, Function>());
-                            FPM.addPass(AutoOMPPass());
-                        }
+                // 'clang -fpass-plugin' — run after all vectorizer passes
+                PB.registerOptimizerLastEPCallback(
+                    [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
+                        FunctionPassManager FPM;
+                        FPM.addPass(LoopSimplifyPass());
+                        FPM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
+                        FPM.addPass(createFunctionToLoopPassAdaptor(IndVarSimplifyPass()));
+                        FPM.addPass(RequireAnalysisPass<LoopAnalysis, Function>());
+                        FPM.addPass(RequireAnalysisPass<LoopAccessAnalysis, Function>());
+                        FPM.addPass(AutoOMPPass());
+                        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
                     });
             }};
 }
