@@ -13,29 +13,8 @@ using namespace llvm;
 
 #define DEBUG_TYPE "auto-omp"
 
-/// After the innermost loop is verified, try promoting to a larger outer loop.
-static void tryPromotion(Loop *&L, Loop *&OutermostL, LoopCandidate &LC,
-                         ScalarEvolution &SE, LoopAccessInfoManager &LAM,
-                         Function &F) {
-    auto Quiet = [](StringRef) {};
-    Loop *Candidate = L->getParentLoop();
-    while (Candidate) {
-        LoopCandidate CandLC;
-        if (!checkStructure(Candidate, SE, CandLC, Quiet))
-            break;
-        const LoopAccessInfo &LAI = LAM.getInfo(*Candidate);
-        if (!checkSafety(Candidate, Candidate, F, CandLC, &LAI, Quiet))
-            break;
-        OutermostL = Candidate;
-        L = Candidate;
-        LC = CandLC;
-        Candidate = Candidate->getParentLoop();
-    }
-}
-
 static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolution &SE,
-                            LoopAccessInfoManager &LAM, Function &F, OptimizationRemarkEmitter &ORE,
-                            SmallPtrSetImpl<Loop *> &SkipLoops) {
+                            LoopAccessInfoManager &LAM, Function &F, OptimizationRemarkEmitter &ORE) {
     auto Remark = [&](Loop *Target, StringRef Msg) {
         ORE.emit([&]() {
             return OptimizationRemarkAnalysis(DEBUG_TYPE, "LoopParallelize",
@@ -43,27 +22,38 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
                    << Msg;
         });
     };
-    auto RemarkAt = [&](StringRef Msg) { Remark(L, Msg); };
 
+    // Try this loop, then drill into single children until we find one we
+    // can parallelize. Once validated, collapse walks back up for the nest.
+    Loop *Candidate = L;
     LoopCandidate LC;
-    if (!checkStructure(L, SE, LC, RemarkAt))
+    bool Validated = false;
+    auto MaybeRemark = [&](StringRef Msg) {
+        if (!Validated)
+            Remark(L, Msg);
+    };
+    do {
+        LoopCandidate CandLC;
+        if (checkStructure(Candidate, SE, CandLC, MaybeRemark)) {
+            const LoopAccessInfo *LAI = Candidate->isInnermost() ? &LAM.getInfo(*Candidate) : nullptr;
+            if (checkSafety(Candidate, Candidate, F, CandLC, LAI, SE, MaybeRemark)) {
+                LC = CandLC;
+                L = Candidate;
+                Validated = true;
+                break;
+            }
+        }
+        // Drill into single child if this level failed.
+        if (Candidate->getSubLoops().size() != 1)
+            break;
+        Candidate = Candidate->getSubLoops()[0];
+    } while (true);
+
+    if (!Validated)
         return false;
 
-    Loop *OutermostL = L;
-    detectCollapse(L, SE, LC, OutermostL);
-
-    const LoopAccessInfo &LAI = LAM.getInfo(*L);
-    if (!checkSafety(L, OutermostL, F, LC, &LAI, RemarkAt))
-        return false;
-
-    // If collapse didn't fire, try promoting to a larger outer loop.
-    if (LC.OuterLevels.empty())
-        tryPromotion(L, OutermostL, LC, SE, LAM, F);
-
-    // Mark all subloops as consumed so the worklist skips them.
-    for (auto *Sub : depth_first(OutermostL))
-        if (Sub != OutermostL)
-            SkipLoops.insert(Sub);
+    // Try to extend downward via collapse into perfectly nested children.
+    Loop *InnermostL = detectCollapse(L, SE, LC);
 
     // Emit remark at the outermost parallelized loop's location.
     unsigned Depth = LC.OuterLevels.size() + 1;
@@ -73,9 +63,9 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
     if (!LC.Reductions.empty())
         Tag += " reduction";
     Tag += " in " + F.getName().str();
-    Remark(OutermostL, Tag);
+    Remark(L, Tag);
 
-    return emitParallelLoop(L, OutermostL, LC, OMPBuilder, F);
+    return emitParallelLoop(InnermostL, L, LC, OMPBuilder, F);
 }
 
 PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -93,19 +83,24 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
     OMPBuilder.Config.IsTargetDevice = false;
     OMPBuilder.initialize();
 
+    // Build worklist outermost-first via depth_first, skip children of
+    // parallelized loops.
     SmallVector<Loop *, 8> Worklist;
     for (auto *TopLoop : LI)
         for (auto *L : depth_first(TopLoop))
-            if (L->isInnermost())
-                Worklist.push_back(L);
+            Worklist.push_back(L);
 
     bool Changed = false;
     SmallPtrSet<Loop *, 8> SkipLoops;
-
     for (Loop *L : Worklist) {
         if (SkipLoops.count(L))
             continue;
-        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAM, F, ORE, SkipLoops);
+        if (parallelizeLoop(L, OMPBuilder, SE, LAM, F, ORE)) {
+            Changed = true;
+            for (auto *Sub : depth_first(L))
+                if (Sub != L)
+                    SkipLoops.insert(Sub);
+        }
     }
 
     if (Changed)

@@ -4,6 +4,8 @@
 #include "LoopCandidate.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 
 namespace llvm {
 
@@ -73,9 +75,19 @@ static bool isCallSafeForLoop(CallBase *CB, Loop *L) {
     return true;
 }
 
+static bool scevDependsOnLoop(const SCEV *S, const Loop *L) {
+    if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+        if (AR->getLoop() == L)
+            return true;
+    for (const SCEV *Op : S->operands())
+        if (scevDependsOnLoop(Op, L))
+            return true;
+    return false;
+}
+
 /// Check that the loop body is safe to parallelize
 bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
-                  const LoopAccessInfo *LAI, auto &Remark) {
+                  const LoopAccessInfo *LAI, ScalarEvolution &SE, auto &Remark) {
     // Validate header PHIs as reductions.
     for (PHINode &PN : LC.Header->phis()) {
         if (&PN == LC.Bounds.IV)
@@ -137,18 +149,33 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
             LC.LoopLocalAllocas.insert(Alloca);
     }
 
-    if (LAI && HasExplicitStores) {
-        if (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0) {
-            Remark("❌ unsafe memory dependence");
-            return false;
-        }
-        auto &DepChecker = LAI->getDepChecker();
-        if (auto *Deps = DepChecker.getDependences())
-            for (auto &D : *Deps)
-                if (D.Type != MemoryDepChecker::Dependence::NoDep) {
-                    Remark("❌ loop-carried memory dependence");
+    if (HasExplicitStores) {
+        if (L->isInnermost()) {
+            // Use LAI for innermost loops.
+            if (LAI) {
+                if (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0) {
+                    Remark("❌ unsafe memory dependence");
                     return false;
                 }
+                auto &DepChecker = LAI->getDepChecker();
+                if (auto *Deps = DepChecker.getDependences())
+                    for (auto &D : *Deps)
+                        if (D.Type != MemoryDepChecker::Dependence::NoDep) {
+                            Remark("❌ loop-carried memory dependence");
+                            return false;
+                        }
+            }
+        } else {
+            // LAI doesn't handle non-innermost loops. Instead, verify all
+            // store addresses depend on the outer loop IV via SCEV.
+            for (BasicBlock *BB : L->blocks())
+                for (Instruction &I : *BB)
+                    if (auto *SI = dyn_cast<StoreInst>(&I))
+                        if (!scevDependsOnLoop(SE.getSCEV(SI->getPointerOperand()), L)) {
+                            Remark("❌ unsafe memory dependence");
+                            return false;
+                        }
+        }
     }
 
     // Reject non-reduction escaping values.

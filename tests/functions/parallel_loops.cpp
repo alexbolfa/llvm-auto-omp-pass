@@ -37,7 +37,16 @@ double fp_product(const double *data, int N) {
     return product;
 }
 
-// ======= Nested loops with collapse =======
+// ======= Nested loops =======
+
+void triangular_iteration_space(int *data, int N, int M, int factor) {
+    // outer is parallelizable
+    for (int i = 0; i < M; ++i) {
+        for (int j = i; j < N; ++j) {
+            data[i * N + j] *= factor;
+        }
+    }
+}
 
 void scale_matrix(int *data, int M, int N, int factor) {
     for (int i = 0; i < M; ++i) {

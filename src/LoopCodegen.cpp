@@ -13,10 +13,14 @@ using namespace llvm;
 
 static Value *computeTripCount(OpenMPIRBuilder &OMPBuilder, const LoopLevel &Lev, DebugLoc DL,
                                BasicBlock *InsertBB) {
-    OpenMPIRBuilder::LocationDescription Loc({InsertBB, InsertBB->end()}, DL);
-    // After loop rotation, the canonical predicate is strict (SLT/SGT)..
+    OpenMPIRBuilder::LocationDescription Loc(
+        {InsertBB, InsertBB->getTerminator()->getIterator()}, DL);
+    // After loop rotation, only descending loops have an inclusive stop.
+    bool NegStep = false;
+    if (auto *CI = dyn_cast<ConstantInt>(Lev.Step))
+        NegStep = CI->isNegative();
     return OMPBuilder.calculateCanonicalLoopTripCount(Loc, Lev.Start, Lev.Stop, Lev.Step,
-                                                      Lev.IsSigned, /*InclusiveStop=*/true);
+                                                      Lev.IsSigned, NegStep);
 }
 
 /// Derive individual IVs from a collapsed iteration index K via div/rem.
@@ -234,9 +238,12 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
             // Wire tc.calc into the preheader.
             TcBB->getTerminator()->eraseFromParent();
             IRBuilder<> TcB(CodeGenIP.getBlock(), CodeGenIP.getPoint());
-            for (auto &I : *TcBB) {
-                I.removeFromParent();
-                TcB.Insert(&I);
+            SmallVector<Instruction *, 16> ToMove;
+            for (auto &I : *TcBB)
+                ToMove.push_back(&I);
+            for (auto *I : ToMove) {
+                I->removeFromParent();
+                TcB.Insert(I);
             }
             TcBB->eraseFromParent();
 

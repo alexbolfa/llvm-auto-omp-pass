@@ -58,8 +58,9 @@ bool checkStructure(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, auto &Remar
     return true;
 }
 
-/// Walk up from L, collecting perfectly nested parents for collapse.
-void detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, Loop *&OutermostL);
+/// Walk down from L through perfectly nested children for collapse.
+/// Returns the innermost loop of the collapsed nest.
+Loop *detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC);
 
 } // end namespace llvm
 

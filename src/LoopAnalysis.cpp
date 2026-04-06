@@ -20,38 +20,45 @@ std::optional<LoopLevel> llvm::extractBounds(Loop *L, ScalarEvolution &SE) {
                      ICmpInst::isSigned(Pred)};
 }
 
-void llvm::detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, Loop *&OutermostL) {
+Loop *llvm::detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC) {
     Loop *Current = L;
-    SmallVector<LoopLevel, 2> TmpLevels;
-    while (Loop *Parent = Current->getParentLoop()) {
-        if (!LoopNest::arePerfectlyNested(*Parent, *Current, SE))
+    while (Current->getSubLoops().size() == 1) {
+        Loop *Child = Current->getSubLoops()[0];
+        if (Current->getSubLoops().size() != 1)
             break;
-        auto Bounds = extractBounds(Parent, SE);
+        bool Clean = true;
+        for (auto *BB : Current->blocks()) {
+            if (Child->contains(BB))
+                continue;
+            for (auto &I : *BB) {
+                if (I.isTerminator() || isa<PHINode>(I))
+                    continue;
+                if (I.mayHaveSideEffects() || I.mayReadFromMemory()) {
+                    Clean = false;
+                    break;
+                }
+            }
+            if (!Clean)
+                break;
+        }
+        if (!Clean)
+            break;
+        auto Bounds = extractBounds(Child, SE);
         if (!Bounds)
             break;
-        // Reject non-rectangular iteration spaces
-        if (!Parent->isLoopInvariant(LC.Bounds.Start) ||
-            !Parent->isLoopInvariant(LC.Bounds.Stop) ||
-            !Parent->isLoopInvariant(LC.Bounds.Step))
+        // Reject non-rectangular iteration spaces.
+        if (!L->isLoopInvariant(Bounds->Start) ||
+            !L->isLoopInvariant(Bounds->Stop) ||
+            !L->isLoopInvariant(Bounds->Step))
             break;
-        bool Rectangular = true;
-        for (auto &Lev : TmpLevels)
-            if (!Parent->isLoopInvariant(Lev.Start) ||
-                !Parent->isLoopInvariant(Lev.Stop) ||
-                !Parent->isLoopInvariant(Lev.Step)) {
-                Rectangular = false;
-                break;
-            }
-        if (!Rectangular)
-            break;
-        TmpLevels.push_back(*Bounds);
-        Current = Parent;
+        LC.OuterLevels.push_back(LC.Bounds);
+        LC.Bounds = *Bounds;
+        Current = Child;
     }
-    if (!TmpLevels.empty()) {
-        OutermostL = Current;
-        for (int i = TmpLevels.size() - 1; i >= 0; --i)
-            LC.OuterLevels.push_back(TmpLevels[i]);
-        LC.Preheader = OutermostL->getLoopPreheader();
-        LC.ExitBlock = OutermostL->getExitBlock();
+    if (!LC.OuterLevels.empty()) {
+        LC.Header = Current->getHeader();
+        LC.Latch = Current->getLoopLatch();
+        LC.ExitingBlock = Current->getExitingBlock();
     }
+    return Current;
 }
