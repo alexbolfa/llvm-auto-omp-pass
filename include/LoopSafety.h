@@ -96,7 +96,6 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
         RedVals.insert(R.Phi);
         RedVals.insert(R.Update);
     }
-    bool HasValidatedCalls = false;
     bool HasExplicitStores = false;
     for (BasicBlock *BB : L->blocks()) {
         for (Instruction &I : *BB) {
@@ -117,9 +116,7 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
                         continue;
                 if (!CB->doesNotAccessMemory() &&
                     !CB->getMemoryEffects().onlyAccessesInaccessibleMem()) {
-                    if (isCallSafeForLoop(CB, L)) {
-                        HasValidatedCalls = true;
-                    } else {
+                    if (!isCallSafeForLoop(CB, L)) {
                         Remark("❌ call with side effects");
                         return false;
                     }
@@ -140,7 +137,7 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
             LC.LoopLocalAllocas.insert(Alloca);
     }
 
-    if (LAI && (HasExplicitStores || HasValidatedCalls)) {
+    if (LAI && HasExplicitStores) {
         if (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0) {
             Remark("❌ unsafe memory dependence");
             return false;
