@@ -23,7 +23,6 @@ struct LoopLevel {
     Value *Stop = nullptr;
     Value *Step = nullptr;
     bool IsSigned = false;
-    bool Inclusive = false;
 };
 
 struct LoopCandidate {

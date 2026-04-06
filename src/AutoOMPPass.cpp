@@ -34,12 +34,9 @@ static void tryPromotion(Loop *&L, Loop *&OutermostL, LoopCandidate &LC,
 }
 
 static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolution &SE,
-                            LoopAccessInfoManager &LAM, Function &F,
-                            OptimizationRemarkEmitter &ORE, bool SuppressRemarks,
+                            LoopAccessInfoManager &LAM, Function &F, OptimizationRemarkEmitter &ORE,
                             SmallPtrSetImpl<Loop *> &SkipLoops) {
     auto Remark = [&](Loop *Target, StringRef Msg) {
-        if (SuppressRemarks)
-            return;
         ORE.emit([&]() {
             return OptimizationRemarkAnalysis(DEBUG_TYPE, "LoopParallelize",
                                               Target->getStartLoc(), Target->getHeader())
@@ -81,7 +78,9 @@ static bool parallelizeLoop(Loop *L, OpenMPIRBuilder &OMPBuilder, ScalarEvolutio
 }
 
 PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
-    bool hadRemark = F.hasFnAttribute("__skip_auto_omp");
+    if (F.hasFnAttribute("__skip_auto_omp")) {
+        return PreservedAnalyses::all();
+    }
     F.addFnAttr("__skip_auto_omp", "true");
 
     auto &LI = AM.getResult<LoopAnalysis>(F);
@@ -105,7 +104,7 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
     for (Loop *L : Worklist) {
         if (SkipLoops.count(L))
             continue;
-        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAM, F, ORE, hadRemark, SkipLoops);
+        Changed |= parallelizeLoop(L, OMPBuilder, SE, LAM, F, ORE, SkipLoops);
     }
 
     if (Changed)

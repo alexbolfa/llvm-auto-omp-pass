@@ -17,8 +17,7 @@ std::optional<LoopLevel> llvm::extractBounds(Loop *L, ScalarEvolution &SE) {
     if (Pred == ICmpInst::BAD_ICMP_PREDICATE)
         return std::nullopt;
     return LoopLevel{IV, &B.getInitialIVValue(), &B.getFinalIVValue(), Step,
-                     ICmpInst::isSigned(Pred),
-                     Pred == ICmpInst::ICMP_SLE || Pred == ICmpInst::ICMP_ULE};
+                     ICmpInst::isSigned(Pred)};
 }
 
 void llvm::detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, Loop *&OutermostL) {

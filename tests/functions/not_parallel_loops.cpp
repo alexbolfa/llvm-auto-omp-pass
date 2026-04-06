@@ -17,6 +17,12 @@ int store_with_reduction_variables(int *data, int n) {
     return a * b;
 }
 
+void shifted_sum(int *a, int *b, int N) {
+    for (int i = N - 2; i >= 0; i--) {
+        a[i + 1] = a[i] + b[i];
+    }
+}
+
 // ====== Cross-iteration memory recurrence ======
 
 void fibonacci(int *data, int n) {

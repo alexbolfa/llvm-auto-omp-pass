@@ -140,11 +140,18 @@ bool checkSafety(Loop *L, Loop *OuterL, Function &F, LoopCandidate &LC,
             LC.LoopLocalAllocas.insert(Alloca);
     }
 
-    // Memory dependence check.
-    if (LAI && (!HasValidatedCalls || HasExplicitStores) &&
-        (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0)) {
-        Remark("❌ unsafe memory dependence");
-        return false;
+    if (LAI && (HasExplicitStores || HasValidatedCalls)) {
+        if (!LAI->canVectorizeMemory() || LAI->getNumRuntimePointerChecks() > 0) {
+            Remark("❌ unsafe memory dependence");
+            return false;
+        }
+        auto &DepChecker = LAI->getDepChecker();
+        if (auto *Deps = DepChecker.getDependences())
+            for (auto &D : *Deps)
+                if (D.Type != MemoryDepChecker::Dependence::NoDep) {
+                    Remark("❌ loop-carried memory dependence");
+                    return false;
+                }
     }
 
     // Reject non-reduction escaping values.

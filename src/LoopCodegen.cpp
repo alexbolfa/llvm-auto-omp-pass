@@ -15,26 +15,12 @@ static void remapOperands(Instruction *I, DenseMap<Value *, Value *> &VMap) {
             I->setOperand(i, It->second);
 }
 
-/// Compute ceil((Stop - Start) / Step), returning 0 for empty ranges.
-static Value *computeTripCount(IRBuilder<> &B, const LoopLevel &Lev, Type *IdxTy) {
-    Value *Start = Lev.Start, *Stop = Lev.Stop, *Step = Lev.Step;
-    if (Start->getType() != IdxTy)
-        Start = B.CreateIntCast(Start, IdxTy, Lev.IsSigned);
-    if (Stop->getType() != IdxTy)
-        Stop = B.CreateIntCast(Stop, IdxTy, Lev.IsSigned);
-    if (Step->getType() != IdxTy)
-        Step = B.CreateIntCast(Step, IdxTy, Lev.IsSigned);
-
-    Value *Span = B.CreateSub(Stop, Start);
-    if (Lev.Inclusive)
-        Span = B.CreateAdd(Span, ConstantInt::get(IdxTy, 1));
-    Value *TC = B.CreateAdd(B.CreateUDiv(B.CreateSub(Span, ConstantInt::get(IdxTy, 1)), Step),
-                            ConstantInt::get(IdxTy, 1));
-    auto EmptyPred = Lev.Inclusive
-                         ? (Lev.IsSigned ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_ULT)
-                         : (Lev.IsSigned ? ICmpInst::ICMP_SLE : ICmpInst::ICMP_ULE);
-    Value *Empty = B.CreateICmp(EmptyPred, Stop, Start);
-    return B.CreateSelect(Empty, ConstantInt::get(IdxTy, 0), TC);
+static Value *computeTripCount(OpenMPIRBuilder &OMPBuilder, const LoopLevel &Lev, DebugLoc DL,
+                               BasicBlock *InsertBB) {
+    OpenMPIRBuilder::LocationDescription Loc({InsertBB, InsertBB->end()}, DL);
+    // After loop rotation, the canonical predicate is strict (SLT/SGT)..
+    return OMPBuilder.calculateCanonicalLoopTripCount(Loc, Lev.Start, Lev.Stop, Lev.Step,
+                                                      Lev.IsSigned, /*InclusiveStop=*/true);
 }
 
 /// Derive individual IVs from a collapsed iteration index K via div/rem.
@@ -235,7 +221,6 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
 
         Expected<CanonicalLoopInfo *> CLI = [&]() -> Expected<CanonicalLoopInfo *> {
             if (LC.OuterLevels.empty()) {
-                // Single loop: use Start/Stop/Step overload.
                 auto LoopBodyCB = [&](OpenMPIRBuilder::InsertPointTy BodyIP,
                                       Value *NewIV) -> Error {
                     DenseMap<Value *, Value *> VMap;
@@ -243,20 +228,36 @@ bool llvm::emitParallelLoop(Loop *L, Loop *OutermostL, LoopCandidate &LC,
                     CloneBody(BodyIP, VMap);
                     return Error::success();
                 };
+                // After loop rotation, descending loops have a strict predicate (SGT)
+                bool NegStep = false;
+                if (auto *CI = dyn_cast<ConstantInt>(Bnd.Step)) {
+                    NegStep = CI->isNegative();
+                }
                 return OMPBuilder.createCanonicalLoop({CodeGenIP, DL}, LoopBodyCB, Bnd.Start,
                                                       Bnd.Stop, Bnd.Step, Bnd.IsSigned,
-                                                      Bnd.Inclusive);
+                                                      /*InclusiveStop=*/NegStep);
             }
 
             // Collapse: linearize the iteration space.
             SmallVector<LoopLevel, 4> AllLevels(LC.OuterLevels.begin(), LC.OuterLevels.end());
             AllLevels.push_back(Bnd);
 
-            IRBuilder<> TcB(CodeGenIP.getBlock(), CodeGenIP.getPoint());
-            Type *IdxTy = AllLevels[0].IV->getType();
+            // Compute per-level trip counts via OMPBuilder, inserting into a
+            // temporary block that feeds into the parallel region.
+            auto *TcBB = BasicBlock::Create(F.getContext(), "tc.calc", &F, LC.ExitBlock);
+            BranchInst::Create(LC.ExitBlock, TcBB); // placeholder terminator
             SmallVector<Value *, 4> TripCounts;
             for (auto &Lev : AllLevels)
-                TripCounts.push_back(computeTripCount(TcB, Lev, IdxTy));
+                TripCounts.push_back(computeTripCount(OMPBuilder, Lev, DL, TcBB));
+
+            // Wire tc.calc into the preheader.
+            TcBB->getTerminator()->eraseFromParent();
+            IRBuilder<> TcB(CodeGenIP.getBlock(), CodeGenIP.getPoint());
+            for (auto &I : *TcBB) {
+                I.removeFromParent();
+                TcB.Insert(&I);
+            }
+            TcBB->eraseFromParent();
 
             Value *TotalTC = TripCounts[0];
             for (unsigned i = 1; i < TripCounts.size(); ++i)
