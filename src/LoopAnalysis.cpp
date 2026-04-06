@@ -29,6 +29,21 @@ void llvm::detectCollapse(Loop *L, ScalarEvolution &SE, LoopCandidate &LC, Loop 
         auto Bounds = extractBounds(Parent, SE);
         if (!Bounds)
             break;
+        // Reject non-rectangular iteration spaces
+        if (!Parent->isLoopInvariant(LC.Bounds.Start) ||
+            !Parent->isLoopInvariant(LC.Bounds.Stop) ||
+            !Parent->isLoopInvariant(LC.Bounds.Step))
+            break;
+        bool Rectangular = true;
+        for (auto &Lev : TmpLevels)
+            if (!Parent->isLoopInvariant(Lev.Start) ||
+                !Parent->isLoopInvariant(Lev.Stop) ||
+                !Parent->isLoopInvariant(Lev.Step)) {
+                Rectangular = false;
+                break;
+            }
+        if (!Rectangular)
+            break;
         TmpLevels.push_back(*Bounds);
         Current = Parent;
     }
