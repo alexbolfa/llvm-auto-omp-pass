@@ -87,6 +87,7 @@ PreservedAnalyses AutoOMPPass::run(Function &F, FunctionAnalysisManager &AM) {
     // parallelized loops.
     SmallVector<Loop *, 8> Worklist;
     for (auto *TopLoop : LI)
+        // TODO(alex): BFS?
         for (auto *L : depth_first(TopLoop))
             Worklist.push_back(L);
 

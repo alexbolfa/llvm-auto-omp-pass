@@ -23,7 +23,7 @@ def load_bench_csv(path):
 
 def plot_comparison(df_base, df_opt, out_path):
     merged = df_base.merge(df_opt, on="short_name", suffixes=("_base", "_opt"))
-    merged["speedup"] = merged["cpu_time_base"] / merged["cpu_time_opt"]
+    merged["speedup"] = merged["real_time_base"] / merged["real_time_opt"]
     merged = merged.sort_values("speedup", ascending=True)
 
     bar_colors = ["#3b4d7a", "#3f8f8f", "#6abf69"]
@@ -49,7 +49,7 @@ def plot_comparison(df_base, df_opt, out_path):
         )
 
     ax.set_xlabel(r"Speedup Factor ($T_{base}/T_{opt}$)", fontsize=13)
-    ax.set_title("AutoOMPPass Optimization Impact", fontsize=16, pad=15)
+    ax.set_title("AutoOMPPass Speedup", fontsize=16, pad=15)
     ax.tick_params(axis="y", labelsize=13)
     ax.grid(axis="x", color="#cccccc", linewidth=0.7)
     ax.set_axisbelow(True)

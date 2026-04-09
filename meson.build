@@ -65,6 +65,7 @@ bench_exe = executable(
   include_directories: include_directories('tests'),
   cpp_args: [
       '-O3',
+      '-Rpass-analysis=auto-omp',
       '-fpass-plugin=' + auto_omp_lib.full_path()
   ],
   link_args: ['-fopenmp'],
@@ -77,7 +78,7 @@ bench_seq_exe = executable(
   'tests/bench.cpp',
   dependencies: [gbench_dep],
   include_directories: include_directories('tests'),
-  cpp_args: ['-O1'],
+  cpp_args: ['-O3'],
 )
 
 benchmark('loop_benchmarks_seq', bench_seq_exe)
