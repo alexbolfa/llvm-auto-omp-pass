@@ -1,36 +1,32 @@
 # AutoOMPPass
 
-An out-of-tree **LLVM pass** designed to automatically parallelize loops and regions using OpenMP.
+Out-of-tree LLVM pass for automatic loop parallelization via OpenMP.
 
-## Usage
+Analyzes LLVM IR to find loops safe to parallelize. Handles reductions, privatization, and loop collapsing. Validated on [TSVC](https://www.netlib.org/benchmark/vectors/).
 
-Run optimized program.
-```bash
-./scripts/run.sh input.cpp
-```
+## Pipeline
 
-Get pass remarks.
-```bash
-./scripts/check-pass.sh input.cpp
-```
+![Pipeline](docs/pipeline.png)
 
-### Manual Run
-If you prefer to run the steps manually:
+## Benchmarks
 
-**1.** Compile to IR
-```bash
-clang -emit-llvm -g -O1 -S input.cpp -o input.ll
-```
+![Benchmarks](docs/bench_chart.png)
 
-**2.** Build and run the pass
+<sub>N = 20M elements, median of 5 runs, -O3</sub>
+
+### Usage
+
+Manually:
 ```bash
 meson setup build
 ninja -C build
+clang -fpass-plugin=./build/AutoOMPPass.so -O1 input.cpp -o output
+```
 
-opt -disable-output input.ll \
-    --load-pass-plugin ./build/AutoOMPPass.* \
-    -passes=auto-omp \
-    --pass-remarks-analysis=auto-omp
+Or use the helper scripts:
+```bash
+./scripts/run.sh input.cpp        # build, compile & run
+./scripts/check-pass.sh input.cpp # inspect pass remarks only
 ```
 
 ## Tests
